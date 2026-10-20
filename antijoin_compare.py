@@ -12,6 +12,8 @@ ArcGIS Pro Python environment (propy.bat).
 """
 
 import os
+from collections import Counter
+
 import arcpy
 
 # ---------------------------------------------------------------- Config
@@ -25,7 +27,15 @@ PARTNER_KEY = "location_id"
 
 # Status field in each dataset (set to None to skip the status comparison)
 MY_STATUS = "status"
-PARTNER_STATUS = "status"
+# Field NAME, not alias (gdb field names have no spaces; check with arcpy.ListFields)
+PARTNER_STATUS = "Served_Status_Dec_25"
+
+# Translates partner codes to Served/Unserved before comparison.
+# ASSUMPTION: 0 = unserved (<25/3), 1 = underserved (25/3 to <100/20), 2 = served (>=100/20).
+# Under the 25/3 rule, underserved and served both count as Served.
+# Verify against the partner's documentation and the cross-tab printed at the end.
+# Set to None when the partner field already holds Served/Unserved text.
+PARTNER_STATUS_MAP = {"0": "Unserved", "1": "Served", "2": "Served"}
 
 # Output geodatabase (created if missing)
 OUT_GDB = r"C:\data\ffa\antijoin_results.gdb"
@@ -128,21 +138,32 @@ export_oids(MY_LAYER, [mine[k][0] for k in only_mine_keys], "only_in_mine")
 export_oids(PARTNER_LAYER, [partner[k][0] for k in only_partner_keys], "only_in_partner")
 
 # Status comparison on shared keys
-mismatch = {}
+def partner_label(value):
+    """Translates a partner status value with PARTNER_STATUS_MAP; flags unmapped codes."""
+    if PARTNER_STATUS_MAP is None:
+        return value
+    return PARTNER_STATUS_MAP.get(norm_key(value), f"UNMAPPED:{value}")
+
+
+mismatch = []
+crosstab = Counter()
 if compare_status:
-    mismatch = {
-        mine[k][0]: partner[k][1]
-        for k in shared_keys
-        if norm_status(mine[k][1]) != norm_status(partner[k][1])
-    }
-    out = export_oids(MY_LAYER, list(mismatch), "status_mismatch")
+    for k in shared_keys:
+        mine_st, partner_raw = mine[k][1], partner[k][1]
+        crosstab[(mine_st, norm_key(partner_raw))] += 1
+        if norm_status(mine_st) != norm_status(partner_label(partner_raw)):
+            mismatch.append(mine[k][0])
+
+    out = export_oids(MY_LAYER, mismatch, "status_mismatch")
     if out:
-        # Adds the partner status next to the original status
+        # Adds the partner code and its translated status next to the original status
+        arcpy.management.AddField(out, "partner_code", "TEXT", field_length=20)
         arcpy.management.AddField(out, "partner_status", "TEXT", field_length=50)
-        key_to_partner = {k: partner[k][1] for k in shared_keys}
-        with arcpy.da.UpdateCursor(out, [MY_KEY, "partner_status"]) as cur:
+        with arcpy.da.UpdateCursor(out, [MY_KEY, "partner_code", "partner_status"]) as cur:
             for row in cur:
-                row[1] = key_to_partner.get(norm_key(row[0]))
+                raw = partner[norm_key(row[0])][1]
+                row[1] = norm_key(raw)
+                row[2] = partner_label(raw)
                 cur.updateRow(row)
 
 # ---------------------------------------------------------------- Summary
@@ -152,3 +173,15 @@ print(f"  Only in mine:            {len(only_mine_keys):,}")
 print(f"  Only in partner:         {len(only_partner_keys):,}")
 if compare_status:
     print(f"  Status mismatches:       {len(mismatch):,}")
+
+    # Cross-tab of own status vs. raw partner code, for checking the code mapping
+    my_vals = sorted({m for m, _ in crosstab}, key=str)
+    codes = sorted({c for _, c in crosstab}, key=str)
+    print("\nCross-tab (rows: my status, columns: partner code)")
+    print(f"  {'':<12}" + "".join(f"{str(c):>14}" for c in codes))
+    for m in my_vals:
+        print(f"  {str(m):<12}" + "".join(f"{crosstab[(m, c)]:>14,}" for c in codes))
+    if PARTNER_STATUS_MAP is not None:
+        unmapped = sorted({c for c in codes if c not in PARTNER_STATUS_MAP}, key=str)
+        if unmapped:
+            print(f"  WARNING: partner codes missing from PARTNER_STATUS_MAP: {unmapped}")
