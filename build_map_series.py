@@ -5,7 +5,7 @@ layouts, each a spatial map series with one page per project:
 
   A - Eligibility changes   : Fabric version 4 vs version 8 eligibility data inside the project area
   B - Grantee submission changes : initial grantee submission vs 2026 Q2 and Q3 data
-  C - Follow-up             : listed locations the Fabric update does not explain
+  C - Follow-up             : listed locations that need follow-up (not explained by observed Fabric change, or a current exception)
 
 Pages are 14 x 8.5 in (legal, landscape) and match the per-project PDFs from the
 notebook: map on the left (whole project visible), plain-English summary,
@@ -44,7 +44,7 @@ NAVY_RGB = [31, 56, 100, 100]
 DENSITY_LAYER = "map_A_no_change_density"          # shaded hexagons for "No change – not eligible"
 DENSITY_NAME = "No change – not eligible (shaded, darker = more)"
 SHADE_RGB = {1: [204, 204, 204, 75], 2: [170, 170, 170, 75], 3: [130, 130, 130, 75]}
-POINT_SIZE = {"Needs follow-up": 5.5, "Explained by the Fabric update": 4.5, "No change": 3.5}
+POINT_SIZE = {"Needs follow-up": 5.5, "Consistent with Fabric change": 4.5, "No change": 3.5}
 T_V4, T_V8 = "Fabric version 4 eligibility data", "Fabric version 8 eligibility data"
 T_SUB4, T_SUB8 = "initial grantee submission", "2026 Q2 and Q3 data"
 
@@ -56,7 +56,7 @@ PAGES = {
           "subtitle": f"Initial grantee submission compared with the {T_SUB8}",
           "points": "map_B_list_changes", "story": "story_b", "legend": "What happened to each submitted location"},
     "C": {"title": "Locations that need follow-up",
-          "subtitle": "Listed locations the Fabric update does not explain",
+          "subtitle": "Listed locations that need follow-up",
           "points": "map_C_follow_up", "story": "story_c", "legend": "Follow-up reason"},
 }
 
