@@ -521,7 +521,7 @@ pd.DataFrame({"Initial grantee submission": sub_v4.groupby("project_key").size()
 
 # %% [markdown]
 # ## 3. Fabric version 4 and version 8 eligibility data – DuckDB
-# Each statewide file is scanned once by DuckDB, reading only the needed columns and keeping only rows inside the padded windows around the six project areas, plus any submitted ID wherever it is. In the same query, IDs are converted to whole numbers, eligibility and BSL flags are derived, and duplicate IDs are removed, keeping the eligible record. Only the filtered rows come back into pandas.
+# Each statewide file is scanned once by DuckDB, reading only the needed columns and keeping only rows inside the padded windows around the six project areas, plus any submitted ID wherever it is. In the same query, IDs are converted to whole numbers, eligibility and BSL flags are derived, and duplicate IDs are removed; when the copies of an ID disagree on eligibility, the ID is marked as *conflicting source records* and left out of every count (never resolved in favour of eligibility). Only the filtered rows come back into pandas.
 #
 # CSV files are read with `read_csv`; a `.gdb` / `.gpkg` is read with the DuckDB spatial extension (`ST_Read`), falling back to pyogrio if the extension cannot be loaded.
 
@@ -614,13 +614,16 @@ def load_fabric(path: Path, layer: str | None, fields: dict, eligible_values: se
     """)
     if ids_table:
         df = con.execute(f"""
-            SELECT CAST(id_num AS BIGINT) AS location_id, lon, lat, elig_raw, eligible, bsl, address, units
+            SELECT CAST(id_num AS BIGINT) AS location_id, lon, lat, elig_raw, eligible, bsl, address, units,
+                   bool_or(eligible) OVER w AND NOT bool_and(eligible) OVER w AS conflict
             FROM {table}
-            QUALIFY row_number() OVER (PARTITION BY id_num ORDER BY eligible DESC) = 1""").df()
+            WINDOW w AS (PARTITION BY id_num)
+            QUALIFY row_number() OVER (PARTITION BY id_num ORDER BY eligible) = 1""").df()
         df["location_id"] = df["location_id"].astype("Int64")
         df["eligible"] = df["eligible"].fillna(False).astype(bool)
         df["bsl"] = df["bsl"].fillna(False).astype(bool)
-        df["counted"] = df["bsl"] | (not BSL_ONLY)
+        df["conflict"] = df["conflict"].fillna(False).astype(bool)
+        df["counted"] = (df["bsl"] | (not BSL_ONLY)) & ~df["conflict"]
         return df
     n_rows, n_bad, n_unique = con.execute(f"""
         SELECT count(*),
@@ -628,10 +631,12 @@ def load_fabric(path: Path, layer: str | None, fields: dict, eligible_values: se
                count(DISTINCT id_num) FILTER (WHERE id_num = floor(id_num))
         FROM fab_{version}""").fetchone()
     df = con.execute(f"""
-        SELECT CAST(id_num AS BIGINT) AS location_id, lon, lat, elig_raw, eligible, bsl, address, units
+        SELECT CAST(id_num AS BIGINT) AS location_id, lon, lat, elig_raw, eligible, bsl, address, units,
+               bool_or(eligible) OVER w AND NOT bool_and(eligible) OVER w AS conflict
         FROM fab_{version}
         WHERE id_num = floor(id_num)
-        QUALIFY row_number() OVER (PARTITION BY id_num ORDER BY eligible DESC) = 1
+        WINDOW w AS (PARTITION BY id_num)
+        QUALIFY row_number() OVER (PARTITION BY id_num ORDER BY eligible) = 1
         ORDER BY location_id""").df()
     log.info("Fabric %s: %s rows in scope → %s unique IDs (%s non-numeric IDs dropped, %s duplicates removed)",
              version, f"{n_rows:,}", f"{n_unique:,}", n_bad, n_rows - n_bad - n_unique)
@@ -645,11 +650,15 @@ def load_fabric(path: Path, layer: str | None, fields: dict, eligible_values: se
                      "rows_read": int(n_rows), "non_numeric_rows_skipped": int(n_bad),
                      "ids_listed_more_than_once": len(fabric_dups[version]),
                      "duplicate_rows_removed": int(n_rows - n_bad - n_unique), "unique_ids_used": int(n_unique),
-                     "note": f"{path.name}; for a duplicated ID the eligible record is kept"})
+                     "note": f"{path.name}; duplicated IDs whose copies disagree on eligibility are marked as "
+                             "conflicting source records and left out of every count"})
     df["location_id"] = df["location_id"].astype("Int64")
     df["eligible"] = df["eligible"].fillna(False).astype(bool)
     df["bsl"] = df["bsl"].fillna(False).astype(bool)
-    df["counted"] = df["bsl"] | (not BSL_ONLY)
+    df["conflict"] = df["conflict"].fillna(False).astype(bool)
+    df["counted"] = (df["bsl"] | (not BSL_ONLY)) & ~df["conflict"]       # conflicting records are never counted
+    log.info("Fabric %s: %s IDs with conflicting source records (left out of the counts)", version,
+             f"{int(df['conflict'].sum()):,}")
     return df
 
 
@@ -658,7 +667,7 @@ fabric = {
     "v4": load_fabric(V4_PATH, V4_LAYER, V4_FIELDS, V4_ELIGIBLE_VALUES, "v4"),
     "v8": load_fabric(V8_PATH, V8_LAYER, V8_FIELDS, V8_ELIGIBLE_VALUES, "v8"),
 }
-ATTR_COLS = ["lon", "lat", "eligible", "bsl", "counted", "address", "units"]
+ATTR_COLS = ["lon", "lat", "eligible", "bsl", "counted", "conflict", "address", "units"]
 attrs = {v: df.set_index("location_id")[ATTR_COLS] for v, df in fabric.items()}
 
 # %% [markdown]
@@ -712,6 +721,7 @@ ST_ELIG = "Eligible"
 ST_NOT_ELIG = "Not eligible"
 ST_ELIG_OUT = "Eligible, outside project area"
 ST_NOT_ELIG_OUT = "Not eligible, outside project area"
+ST_CONFLICT = "Conflicting source records"
 
 
 def fabric_status(key: str, lid: int, v: str) -> str:
@@ -719,6 +729,8 @@ def fabric_status(key: str, lid: int, v: str) -> str:
     a = attrs[v]
     if lid not in a.index:
         return ST_NOT_IN
+    if a.at[lid, "conflict"]:
+        return ST_CONFLICT
     if not a.at[lid, "counted"]:
         return ST_NOT_BSL
     elig = bool(a.at[lid, "eligible"])
@@ -747,8 +759,9 @@ for df, v, label in ((sub_v4, "v4", "1: Initial grantee submission vs Fabric ver
         rows.append({"comparison": label, "project_key": key, "submitted": n, "found": found,
                      "not_found": n - found, "in_project_area": int(st.isin([ST_ELIG, ST_NOT_ELIG]).sum()),
                      "outside_area": int(st.isin([ST_ELIG_OUT, ST_NOT_ELIG_OUT]).sum()),
-                     "not_bsl": int((st == ST_NOT_BSL).sum()), "eligible": elig,
-                     "not_eligible": found - elig - int((st == ST_NOT_BSL).sum()),
+                     "not_bsl": int((st == ST_NOT_BSL).sum()), "conflicting": int((st == ST_CONFLICT).sum()),
+                     "eligible": elig,
+                     "not_eligible": found - elig - int(st.isin([ST_NOT_BSL, ST_CONFLICT]).sum()),
                      "pct_found": round(found / n * 100, 1) if n else np.nan,
                      "pct_eligible_of_found": round(elig / found * 100, 1) if found else np.nan})
 cmp12 = pd.DataFrame(rows)
@@ -844,30 +857,34 @@ CAT_NEW = "ID only in newer version (new)"
 CAT_MOVED = "Moved into or out of the project area"
 CAT_BSL = "BSL status changed"
 CAT_SAME = "Unchanged"
-CATEGORY_ORDER = [CAT_ELIG_LOST, CAT_ELIG_GAINED, CAT_RETIRED, CAT_NEW, CAT_MOVED, CAT_BSL, CAT_SAME]
+CAT_CONFLICT = "Conflicting source records"
+CATEGORY_ORDER = [CAT_CONFLICT, CAT_ELIG_LOST, CAT_ELIG_GAINED, CAT_RETIRED, CAT_NEW, CAT_MOVED, CAT_BSL, CAT_SAME]
 
 
 def compare_fabric(key: str) -> pd.DataFrame:
     """One row per Fabric location counted in the project area in V4 and/or V8, with its category."""
-    counted = {}
+    counted, conflicted = {}, {}
     for v in ("v4", "v8"):
         m = pd.Index(sorted(area_sets[v].get(key, set())), dtype="Int64")
         counted[v] = set(m[attrs[v].loc[m, "counted"].to_numpy()])
-    df = pd.DataFrame({"project_key": key,
-                       "location_id": pd.array(sorted(counted["v4"] | counted["v8"]), dtype="Int64")})
+        conflicted[v] = set(m[attrs[v].loc[m, "conflict"].to_numpy()])
+    ids = counted["v4"] | counted["v8"] | conflicted["v4"] | conflicted["v8"]
+    df = pd.DataFrame({"project_key": key, "location_id": pd.array(sorted(ids), dtype="Int64")})
     for v in ("v4", "v8"):
         a = attrs[v].reindex(df["location_id"])
         df[f"in_{v}"] = df["location_id"].isin(attrs[v].index).to_numpy()
         df[f"in_area_{v}"] = df["location_id"].isin(area_sets[v].get(key, set())).to_numpy()
         df[f"counted_{v}"] = df["location_id"].isin(counted[v]).to_numpy()
+        df[f"conflict_{v}"] = df["location_id"].isin(conflicted[v]).to_numpy()
         df[f"bsl_{v}"] = a["bsl"].fillna(False).astype(bool).to_numpy()
         df[f"elig_{v}"] = a["eligible"].fillna(False).astype(bool).to_numpy()
         df[f"lon_{v}"], df[f"lat_{v}"] = a["lon"].to_numpy(), a["lat"].to_numpy()
         df[f"address_{v}"] = a["address"].to_numpy()
-    conds = [df["in_v4"] & ~df["in_v8"], ~df["in_v4"] & df["in_v8"],
+    conds = [df["conflict_v4"] | df["conflict_v8"], df["in_v4"] & ~df["in_v8"], ~df["in_v4"] & df["in_v8"],
              df["in_area_v4"] != df["in_area_v8"], df["counted_v4"] != df["counted_v8"],
              df["elig_v4"] & ~df["elig_v8"], ~df["elig_v4"] & df["elig_v8"]]
-    df["category"] = np.select(conds, [CAT_RETIRED, CAT_NEW, CAT_MOVED, CAT_BSL, CAT_ELIG_LOST, CAT_ELIG_GAINED],
+    df["category"] = np.select(conds, [CAT_CONFLICT, CAT_RETIRED, CAT_NEW, CAT_MOVED, CAT_BSL, CAT_ELIG_LOST,
+                                       CAT_ELIG_GAINED],
                                default=CAT_SAME)
     df["delta_total"] = df["counted_v8"].astype(int) - df["counted_v4"].astype(int)
     df["delta_eligible"] = ((df["counted_v8"] & df["elig_v8"]).astype(int)
@@ -921,6 +938,8 @@ def explain(r: pd.Series) -> str:
     s4_, s8_ = r["fabric_status_v4"], r["fabric_status_v8"]
     e4, e8 = s4_ in (ST_ELIG, ST_ELIG_OUT), s8_ in (ST_ELIG, ST_ELIG_OUT)
     c = r["sub_change"]
+    if ST_CONFLICT in (s4_, s8_):
+        return "Conflicting source records in the Fabric"
     if c == SC_KEPT:
         if e4 and e8:
             return "Kept: eligible in V4 and V8"
@@ -990,13 +1009,13 @@ coverage
 #
 # | Tier | Meaning |
 # |---|---|
-# | **Needs follow-up** | Something in the 2026 Q2 and Q3 data (or missing from it) that the Fabric update does not explain |
-# | **Explained by the Fabric update** | Caused by the change from the Fabric version 4 to the Fabric version 8 eligibility data: service reported, IDs removed, points moved, new locations |
+# | **Needs follow-up** | Something in the 2026 Q2 and Q3 data (or missing from it) that is not explained by the observed Fabric change, or a source-data conflict |
+# | **Consistent with Fabric change** | Matches an observed change between the Fabric version 4 and version 8 eligibility data (eligibility classification changed, ID present in only one version, point moved). The data shows association, not cause |
 # | **No change** | Nothing changed |
 #
 # * **Eligibility changes (Fabric version 4 → version 8 eligibility data):** every Fabric location in the project area.
 # * **Grantee submission changes (initial grantee submission → 2026 Q2 and Q3 data):** every listed location. Follow-up checks come first: a location in the 2026 Q2 and Q3 data that is outside the area, missing from the Fabric version 8 eligibility data or not eligible is flagged even if it was also in the initial grantee submission.
-# * **Follow-up:** the four follow-up categories only.
+# * **Follow-up:** the follow-up categories only; each issue (missing ID, outside the area, not eligible, not a serviceable location, removed but eligible, added without a Fabric change, conflicting records) has its own category.
 
 # %%
 # Names used for the four data sources in every output
@@ -1025,23 +1044,31 @@ def cap(text: str) -> str:
 RGB = {"darkred": (128, 0, 38), "darkorange": (217, 95, 2), "pink": (197, 27, 125),
        "gold": (230, 171, 2), "purple": (118, 42, 131), "lilac": (175, 141, 195), "brown": (140, 81, 10),
        "blue": (33, 102, 172), "teal": (1, 133, 113), "slate": (99, 99, 99),
-       "skyblue": (86, 180, 233), "grey": (150, 150, 150), "lightgrey": (205, 205, 205)}
-TIER_FU, TIER_EX, TIER_NC = "Needs follow-up", "Explained by the Fabric update", "No change"
+       "skyblue": (86, 180, 233), "grey": (150, 150, 150), "lightgrey": (205, 205, 205),
+       "charcoal": (45, 45, 45), "olive": (128, 128, 0)}
+TIER_FU, TIER_EX, TIER_NC = "Needs follow-up", "Consistent with Fabric change", "No change"
 TIER_ORDER = [TIER_FU, TIER_EX, TIER_NC]
 
-# code: (plain label, what it means, RGB colour, tier)
+# code: (plain label, what it means, RGB colour, tier). Labels state what the data shows, not why it happened.
 FABRIC_CLASSES = {
-    "A1": ("Lost eligibility (now has service)",
-           f"Eligible in the {T_V4}, not eligible in the {T_V8}: cable or fiber at 25/3 Mbps or better is now reported.",
+    "A10": ("Conflicting source records",
+            "The copies of this location ID in one Fabric file disagree on eligibility; it is left out of every count "
+            "until the source is corrected.", RGB["olive"], TIER_FU),
+    "A1": ("Eligible to not eligible",
+           f"Eligibility classification changed from eligible in the {T_V4} to not eligible in the {T_V8}.",
            RGB["gold"], TIER_EX),
-    "A2": ("Became eligible", f"Not eligible in the {T_V4}, eligible in the {T_V8}.", RGB["blue"], TIER_EX),
-    "A4": ("ID removed in Fabric version 8",
-           f"This ID from the {T_V4} is not in the {T_V8}.", RGB["brown"], TIER_EX),
-    "A5": ("New location in Fabric version 8",
-           f"This location exists only in the {T_V8}: a newly mapped building.", RGB["teal"], TIER_EX),
+    "A2": ("Not eligible to eligible",
+           f"Eligibility classification changed from not eligible in the {T_V4} to eligible in the {T_V8}.",
+           RGB["blue"], TIER_EX),
+    "A4": ("ID present only in Fabric version 4",
+           f"This location ID is in the {T_V4} but not in the {T_V8}. That does not show the building is gone.",
+           RGB["brown"], TIER_EX),
+    "A5": ("ID present only in Fabric version 8",
+           f"This location ID is in the {T_V8} but not in the {T_V4}. That does not show the building is new.",
+           RGB["teal"], TIER_EX),
     "A6": ("Map point moved across boundary",
-           f"Same ID in both; its point moved into or out of the project area between the {T_V4} and the {T_V8}.",
-           RGB["lilac"], TIER_EX),
+           f"Same ID in both; its point moved into or out of the project area between the {T_V4} and the {T_V8} "
+           "(a map edit, not a building that moved).", RGB["lilac"], TIER_EX),
     "A7": ("Serviceable-location status changed",
            f"Counted as a broadband serviceable location in only one of the {T_V4} and the {T_V8}.", RGB["slate"], TIER_EX),
     "A8": ("No change – eligible", f"Same ID, inside the area, eligible in both the {T_V4} and the {T_V8}.",
@@ -1050,51 +1077,60 @@ FABRIC_CLASSES = {
            f"Same ID, inside the area, not eligible in either the {T_V4} or the {T_V8}.", RGB["lightgrey"], TIER_NC),
 }
 SUB_CLASSES = {
-    "B01": ("In 2026 Q2/Q3 data, outside area or not in Fabric version 8",
-            f"In the {T_SUB8}, but its point in the {T_V8} is outside the project area, or the ID is not in the {T_V8}.",
-            RGB["darkred"], TIER_FU),
+    "B01": ("In 2026 Q2/Q3 data, missing from Fabric version 8",
+            f"In the {T_SUB8}, but the location ID is not in the {T_V8}.", RGB["darkred"], TIER_FU),
+    "B13": ("In 2026 Q2/Q3 data, outside the award area",
+            f"In the {T_SUB8}, but its point in the {T_V8} is outside the project area.", RGB["charcoal"], TIER_FU),
     "B02": ("In 2026 Q2/Q3 data, not eligible in Fabric version 8",
-            f"In the {T_SUB8}, but the {T_V8} shows cable or fiber service there.", RGB["darkorange"], TIER_FU),
+            f"In the {T_SUB8}, but the {T_V8} classifies it as not eligible.", RGB["darkorange"], TIER_FU),
+    "B14": ("In 2026 Q2/Q3 data, not a broadband serviceable location",
+            f"In the {T_SUB8}, but the {T_V8} does not count it as a broadband serviceable location.",
+            RGB["slate"], TIER_FU),
     "B03": ("Not carried into 2026 Q2/Q3 data, still eligible",
-            f"In the {T_SUB4} but not the {T_SUB8}, although still eligible in the {T_V8}.", RGB["purple"], TIER_FU),
+            f"In the {T_SUB4} but not the {T_SUB8}, although still eligible inside the area in the {T_V8}.",
+            RGB["purple"], TIER_FU),
     "B04": ("New in 2026 Q2/Q3 data, already eligible in Fabric version 4",
             f"In the {T_SUB8} but not the {T_SUB4}, although already eligible in the {T_V4}.", RGB["pink"], TIER_FU),
-    "B05": ("Not carried into 2026 Q2/Q3 data, now has service",
-            f"In the {T_SUB4} only; the {T_V8} shows service there.", RGB["gold"], TIER_EX),
-    "B06": ("Not carried into 2026 Q2/Q3 data, ID removed in Fabric version 8",
+    "B12": ("Conflicting source records in the Fabric",
+            "The copies of this location ID in a Fabric file disagree on eligibility, so its status cannot be read.",
+            RGB["olive"], TIER_FU),
+    "B05": ("Not carried into 2026 Q2/Q3 data, now not eligible",
+            f"In the {T_SUB4} only; the {T_V8} classifies it as not eligible.", RGB["gold"], TIER_EX),
+    "B06": ("Not carried into 2026 Q2/Q3 data, ID present only in Fabric version 4",
             f"In the {T_SUB4} only; the ID is not in the {T_V8}.", RGB["brown"], TIER_EX),
     "B07": ("Not carried over or new, point moved across boundary",
             f"The point moved out of or into the project area between the {T_V4} and the {T_V8}.", RGB["lilac"], TIER_EX),
-    "B09": ("New in 2026 Q2/Q3 data, became eligible",
+    "B09": ("New in 2026 Q2/Q3 data, not eligible to eligible",
             f"In the {T_SUB8} only; not eligible in the {T_V4}, eligible in the {T_V8}.", RGB["blue"], TIER_EX),
-    "B10": ("New in 2026 Q2/Q3 data, new location in Fabric version 8",
-            f"In the {T_SUB8} only; the location exists only in the {T_V8}.", RGB["teal"], TIER_EX),
+    "B10": ("New in 2026 Q2/Q3 data, ID present only in Fabric version 8",
+            f"In the {T_SUB8} only; the location ID is in the {T_V8} but not the {T_V4}.", RGB["teal"], TIER_EX),
     "B11": ("In both submissions, eligible in Fabric version 8",
             f"Same ID in the {T_SUB4} and the {T_SUB8}; inside the area and eligible in the {T_V8}.", RGB["grey"], TIER_NC),
 }
-FOLLOW_UP_CLASSES = ["B01", "B02", "B03", "B04"]
+FOLLOW_UP_CLASSES = ["B01", "B13", "B02", "B14", "B03", "B04", "B12"]
 FOLLOW_CLASSES = {**{k: SUB_CLASSES[k] for k in FOLLOW_UP_CLASSES},
                   "C0": ("Other listed location", "Listed location that needs no follow-up.", RGB["lightgrey"], TIER_NC)}
 NO_CHANGE_CLASSES = {c for c, v in {**FABRIC_CLASSES, **SUB_CLASSES}.items() if v[3] == TIER_NC} | {"C0"}
 
 # Plain wording for the synthesis explanations (Section 5)
 WHY_PLAIN = {
-    "Dropped: ID retired in V8 Fabric": f"ID not in the {T_V8}",
+    "Dropped: ID retired in V8 Fabric": f"ID present only in the {T_V4}",
     "Dropped: outside project area in V8": f"Outside the project area in the {T_V8}",
-    "Dropped: not eligible in V8 (served)": f"Has service in the {T_V8}",
+    "Dropped: not eligible in V8 (served)": f"Not eligible in the {T_V8}",
     "Dropped: still eligible in V8 (applicant decision)": f"Still eligible in the {T_V8} – grantee decision",
-    "Added: new location in V8 Fabric": f"New location, only in the {T_V8}",
+    "Added: new location in V8 Fabric": f"ID present only in the {T_V8}",
     "Added: moved into project area in V8": f"Moved into the project area in the {T_V8}",
-    "Added: became eligible in V8": f"Became eligible in the {T_V8}",
+    "Added: became eligible in V8": f"Not eligible to eligible in the {T_V8}",
     "Added: already eligible in V4 (applicant decision)": f"Already eligible in the {T_V4} – grantee decision",
     "Kept: eligible in V4 and V8": "No change",
-    "Kept: lost eligibility in V8 (now served)": f"Has service in the {T_V8}",
+    "Kept: lost eligibility in V8 (now served)": f"Eligible to not eligible in the {T_V8}",
     "Kept: ID not in V8 Fabric": f"ID missing from the {T_V8}",
-    "Kept: gained eligibility in V8": f"Became eligible in the {T_V8}",
+    "Kept: gained eligibility in V8": f"Not eligible to eligible in the {T_V8}",
+    "Conflicting source records in the Fabric": "Conflicting source records in the Fabric",
     "Kept: not eligible in V4 or V8": f"Not eligible in the {T_V4} or the {T_V8}",
 }
 STATUS_PLAIN = {ST_NOT_IN: "Not in this Fabric version", ST_NOT_BSL: "Not a serviceable location",
-                ST_ELIG: "Eligible", ST_NOT_ELIG: "Not eligible (has service)",
+                ST_ELIG: "Eligible", ST_NOT_ELIG: "Not eligible", ST_CONFLICT: "Conflicting source records",
                 ST_ELIG_OUT: "Eligible, but outside project area", ST_NOT_ELIG_OUT: "Not eligible, outside project area"}
 LABEL = {p: v["label"] for p, v in PROJECTS.items()}
 
@@ -1106,7 +1142,7 @@ def fmt_id(v) -> str:
 
 # ---- Eligibility changes: Fabric locations in the project areas (one point per building)
 cat = changes["category"]
-cls = cat.map({CAT_ELIG_LOST: "A1", CAT_ELIG_GAINED: "A2", CAT_MOVED: "A6", CAT_BSL: "A7"})
+cls = cat.map({CAT_CONFLICT: "A10", CAT_ELIG_LOST: "A1", CAT_ELIG_GAINED: "A2", CAT_MOVED: "A6", CAT_BSL: "A7"})
 cls = cls.mask(cat.eq(CAT_RETIRED), "A4").mask(cat.eq(CAT_NEW), "A5")
 same = cat.eq(CAT_SAME)
 cls = cls.mask(same & changes["elig_v8"], "A8").mask(same & ~changes["elig_v8"], "A9")
@@ -1126,10 +1162,16 @@ changes["project"] = changes["project_key"].map(LABEL)
 s4, s8 = subs["fabric_status_v4"], subs["fabric_status_v8"]
 chg = subs["sub_change"]
 in_list8 = subs["in_sub_v8"]
-outside8 = s8.isin([ST_NOT_IN, ST_ELIG_OUT, ST_NOT_ELIG_OUT, ST_NOT_BSL])
+changed_list = chg.isin([SC_ADDED, SC_DROPPED])
+non_bsl8 = (pd.Series(attrs["v8"]["bsl"].reindex(subs["location_id"].astype("int64")).eq(False).to_numpy(),
+                      index=subs.index) & ~s8.isin([ST_NOT_IN, ST_CONFLICT])) | s8.eq(ST_NOT_BSL)
 subs["map_class"] = np.select(
-    [in_list8 & outside8,
+    [in_list8 & s8.eq(ST_NOT_IN),
+     in_list8 & s8.eq(ST_CONFLICT),
+     in_list8 & s8.isin([ST_ELIG_OUT, ST_NOT_ELIG_OUT]),
+     in_list8 & non_bsl8,
      in_list8 & s8.eq(ST_NOT_ELIG),
+     changed_list & (s4.eq(ST_CONFLICT) | s8.eq(ST_CONFLICT)),
      chg.eq(SC_ADDED) & s4.eq(ST_ELIG),
      chg.eq(SC_ADDED) & s4.isin([ST_ELIG_OUT, ST_NOT_ELIG_OUT]),
      chg.eq(SC_ADDED) & s4.eq(ST_NOT_IN),
@@ -1138,7 +1180,7 @@ subs["map_class"] = np.select(
      chg.eq(SC_DROPPED) & s8.isin([ST_ELIG_OUT, ST_NOT_ELIG_OUT]),
      chg.eq(SC_DROPPED) & s8.eq(ST_ELIG),
      chg.eq(SC_DROPPED)],
-    ["B01", "B02", "B04", "B07", "B10", "B09", "B06", "B07", "B03", "B05"], default="B11")
+    ["B01", "B12", "B13", "B14", "B02", "B12", "B04", "B07", "B10", "B09", "B06", "B07", "B03", "B05"], default="B11")
 subs["map_show"] = True
 subs["map_label"] = subs["map_class"].map(lambda c: SUB_CLASSES[c][0])
 subs["what_it_means"] = subs["map_class"].map(lambda c: SUB_CLASSES[c][1])
@@ -1191,7 +1233,7 @@ for v in ("v4", "v8"):
                          "ids_listed_more_than_once": len(mk),
                          "duplicate_rows_removed": int((mk["times_listed"] - 1).sum()), "unique_ids_used": n_ids,
                          "note": f"{int(mk['eligibility_conflict'].sum())} duplicated IDs had conflicting eligibility; "
-                                 "the eligible record was kept"})
+                                 "they are marked as conflicting source records and left out of the counts"})
 cleaning = (pd.concat([pd.DataFrame(CLEANING), pd.DataFrame(fab_rows)], ignore_index=True)
             .drop_duplicates(["dataset", "project_key"], keep="last").reset_index(drop=True))
 cleaning["project"] = cleaning["project_key"].map(LABEL).fillna("All projects (statewide read window)")
@@ -1307,22 +1349,25 @@ def story_a(r: pd.Series) -> str:
          f"({change_words(int(r['elig_chg']), 'eligible')}).")
     parts = []
     if n["A1"]:
-        parts.append(f"{n['A1']:,} lost eligibility because cable or fiber service is now reported")
+        parts.append(f"{n['A1']:,} changed from eligible to not eligible")
     if n["A2"]:
-        parts.append(f"{n['A2']:,} became eligible")
+        parts.append(f"{n['A2']:,} changed from not eligible to eligible")
     if n["A4"]:
-        parts.append(f"{plural(n['A4'], 'ID')} no longer in the {T_V8}")
+        parts.append(f"{plural(n['A4'], 'ID')} present only in the {T_V4}")
     if n["A5"]:
-        parts.append(f"{plural(n['A5'], 'new location')} added")
+        parts.append(f"{plural(n['A5'], 'ID')} present only in the {T_V8}")
     if n["A6"]:
         parts.append(f"{n['A6']:,} map points moved across the boundary")
     if n["A7"]:
         parts.append(f"{n['A7']:,} changed serviceable-location status")
     if parts:
-        s += " Changes, all explained by the Fabric update: " + "; ".join(parts) + "."
+        s += " Observed Fabric changes: " + "; ".join(parts) + "."
+    if n["A10"]:
+        s += f" {plural(n['A10'], 'ID')} with conflicting source records {'is' if n['A10'] == 1 else 'are'} left out of the counts."
     if r["f4_dup_ids"] or r["f8_dup_ids"]:
         s += (f" Data note: {r['f4_dup_ids']:,} IDs in the {T_V4} and {r['f8_dup_ids']:,} in the {T_V8} appeared more "
-              "than once here; each is counted once, keeping the eligible record.")
+              "than once here; each is counted once, and IDs whose copies disagree on eligibility are left out "
+              "as conflicting source records.")
     return s
 
 
@@ -1360,7 +1405,7 @@ def story_c(r: pd.Series) -> str:
     n = plain_b.loc[r["project_key"]]
     qr = qr_term(r["project_key"])
     if not r["fu_total"]:
-        return "No listed location needs follow-up: every change is explained by the Fabric update."
+        return "No listed location needs follow-up: every list change is consistent with the observed Fabric change."
     head = f"{plural(r['fu_total'], 'listed location')} need{'s' if r['fu_total'] == 1 else ''} follow-up:"
     items = [f"{n[c]:,} {lower_first(SUB_CLASSES[c][0]).replace(T_SUB8_SHORT, qr)}" for c in FOLLOW_UP_CLASSES if n[c]]
     return head + " " + "; ".join(items) + ". Location IDs are in the project workbook, tab 'Follow-up list'."
@@ -1389,19 +1434,16 @@ summary.drop(columns=["narrative", "bottom_line", "story_a", "story_b", "story_c
 # | C – From-to tables | Fabric locations in the area; each grantee list | Status in version 4 → status in version 8 |
 # | D – Coverage | Eligible locations inside the polygon | Share listed by the grantee (version 4 with the initial grantee submission, version 8 with the 2026 data) |
 #
-# Status of a location in one Fabric version: **Eligible, inside** · **Not eligible, inside** · **Outside the project area** · **Not in the Fabric**.
+# Status of a location in one Fabric version, built from separate facts (present in the Fabric, inside the award area,
+# eligible, conflicting source records): **Eligible, inside** · **Not eligible, inside** · **Eligible, outside** ·
+# **Not eligible, outside** · **Not in the Fabric** · **Conflicting source records**.
 # Every block reconciles: listed = matched + not found; matched = inside + outside; each of those = eligible + not eligible.
 # The 2026 Q2 and Q3 data is the grantee's **planned** location list.
 #
-# **Change patterns** (a project can show several; *Stable* only when none of the first five applies):
-#
-# | Pattern | Rule (counts need at least `MIN_LOCATIONS`) |
-# |---|---|
-# | Eligibility drop from new service | Initial-list locations eligible inside the area in version 4 but not eligible in version 8 ≥ `SERVICE_DROP_SHARE` of the initial list |
-# | Fewer planned locations | 2026 list ≤ (1 − `LIST_CHANGE_SHARE`) × initial list, or still-eligible locations not carried over ≥ `DROPPED_ELIGIBLE_SHARE` of the initial list |
-# | More or shifted planned locations | 2026 list ≥ (1 + `LIST_CHANGE_SHARE`) × initial list, or 2026 locations outside the area ≥ `OUTSIDE_SHARE` of the 2026 list |
-# | ID changes | Initial-list IDs no longer in version 8 ≥ `ID_CHURN_SHARE` of the initial list |
-# | Data quality | Duplicate or invalid rows, 2026 IDs not in version 8, or grantee coordinates more than `COORD_GAP_M` m from the Fabric point for ≥ `COORD_GAP_SHARE` of matched locations |
+# **Change patterns** come from analyst-defined review thresholds (all configurable below and listed, with the count and
+# denominator behind each, in the *Review rules* tab). A project can show several; when none is triggered it reads
+# *No configured material-change threshold triggered* — a statement about the thresholds, not a finding that nothing
+# changed.
 
 # %%
 # ---- thresholds for the change patterns
@@ -1415,11 +1457,20 @@ COORD_GAP_M, COORD_GAP_SHARE = 100, 0.05
 EDGE_M = 50                     # "near the boundary": Fabric point within this distance of the polygon edge
 OUT_BANDS_M = (100, 1000)       # outside distance bands: < 100 m, 100 m – 1 km, > 1 km
 
-S_EI, S_NI, S_OUT, S_NOT, S_NB = ("Eligible, inside", "Not eligible, inside", "Outside the project area",
-                                  "Not in the Fabric", "Not counted (not a broadband serviceable location)")
-STATES = [S_EI, S_NI, S_OUT, S_NOT]
-STATE_OF = {ST_ELIG: S_EI, ST_NOT_ELIG: S_NI, ST_ELIG_OUT: S_OUT, ST_NOT_ELIG_OUT: S_OUT, ST_NOT_IN: S_NOT,
-            ST_NOT_BSL: S_NB}
+S_EI, S_NI, S_EO, S_NO, S_NOT, S_CONF, S_NB = (
+    "Eligible, inside", "Not eligible, inside", "Eligible, outside", "Not eligible, outside", "Not in the Fabric",
+    "Conflicting source records", "Not counted (not a broadband serviceable location)")
+STATES = [S_EI, S_NI, S_EO, S_NO, S_NOT, S_CONF]
+OUT = [S_EO, S_NO]
+STATE_OF = {ST_ELIG: S_EI, ST_NOT_ELIG: S_NI, ST_ELIG_OUT: S_EO, ST_NOT_ELIG_OUT: S_NO, ST_NOT_IN: S_NOT,
+            ST_CONFLICT: S_CONF, ST_NOT_BSL: S_NB}
+
+
+def fsum(m: pd.DataFrame, a, b) -> int:
+    """Sum of from-to cells; a and b are one status or a list of statuses (missing ones count 0)."""
+    rows = [x for x in ([a] if isinstance(a, str) else a) if x in m.index]
+    cols = [x for x in ([b] if isinstance(b, str) else b) if x in m.columns]
+    return int(m.loc[rows, cols].to_numpy().sum()) if rows and cols else 0
 HAS_UNITS = {v: attrs[v]["units"].notna().any() for v in ("v4", "v8")}
 POLY_M = areas.set_index("project_key").to_crs(METRIC_CRS).geometry
 
@@ -1438,7 +1489,8 @@ def fabric_block(key: str, v: str) -> dict:
     a = attrs[v].loc[ids]
     e = a["eligible"].astype(bool)
     r = {"loc": len(a), "elig": int(e.sum()), "nelig": int((~e).sum()),
-         "bsl": int(a["bsl"].sum()), "nonbsl": int((~a["bsl"]).sum())}
+         "bsl": int(a["bsl"].sum()), "nonbsl": int((~a["bsl"]).sum()),
+         "conflict": sum(1 for i in area_sets[v].get(key, set()) if attrs[v].at[i, "conflict"])}
     if HAS_UNITS[v]:
         r["units"] = int(a["units"].fillna(0).sum())
         r["units_elig"] = int(a.loc[e, "units"].fillna(0).sum())
@@ -1461,6 +1513,7 @@ def list_block(key: str, sub: pd.DataFrame, v: str, own: bool) -> tuple[dict, pd
     edge = pts.distance(poly.boundary)
     o = outside[matched]
     r = {"listed": len(ids), "matched": int(matched.sum()), "notfound": int((~matched).sum()),
+         "conflict": int(st.eq(ST_CONFLICT).sum()),
          "in_elig": int((inside & elig).sum()), "in_nelig": int((inside & ~elig).sum()),
          "out_elig": int((outside & elig).sum()), "out_nelig": int((outside & ~elig).sum()),
          "bsl": int((matched & a["bsl"].fillna(False).astype(bool)).sum()),
@@ -1548,43 +1601,62 @@ def story_why(key: str) -> str:
     k, qr = KEY[key], qr_term(key)
     f = tmat(key, "Fabric locations in the project area")
     e4, e8 = k["a_v4_elig"], k["a_v8_elig"]
-    kept = int(f.at[S_EI, S_EI])
-    lost = join_parts([f"{f.at[S_EI, S_NI]:,} now have service" if f.at[S_EI, S_NI] else "",
-                       f"{f.at[S_EI, S_NOT]:,} are no longer in the Fabric" if f.at[S_EI, S_NOT] else "",
-                       f"{f.at[S_EI, S_OUT]:,} now lie outside the area" if f.at[S_EI, S_OUT] else ""])
-    won = join_parts([f"{f.at[S_NI, S_EI]:,} became eligible" if f.at[S_NI, S_EI] else "",
-                      f"{f.at[S_NOT, S_EI]:,} are new IDs" if f.at[S_NOT, S_EI] else "",
-                      f"{f.at[S_OUT, S_EI]:,} moved into the area" if f.at[S_OUT, S_EI] else ""])
+    kept = fsum(f, S_EI, S_EI)
+    lost = join_parts([f"{fsum(f, S_EI, S_NI):,} changed to not eligible" if fsum(f, S_EI, S_NI) else "",
+                       f"{fsum(f, S_EI, S_NOT):,} are IDs present only in version 4" if fsum(f, S_EI, S_NOT) else "",
+                       f"{fsum(f, S_EI, OUT):,} have points now outside the area" if fsum(f, S_EI, OUT) else "",
+                       f"{fsum(f, S_EI, S_CONF):,} have conflicting source records" if fsum(f, S_EI, S_CONF) else ""])
+    won = join_parts([f"{fsum(f, S_NI, S_EI):,} changed from not eligible" if fsum(f, S_NI, S_EI) else "",
+                      f"{fsum(f, S_NOT, S_EI):,} are IDs present only in version 8" if fsum(f, S_NOT, S_EI) else "",
+                      f"{fsum(f, OUT, S_EI):,} have points that moved into the area" if fsum(f, OUT, S_EI) else "",
+                      f"{fsum(f, S_CONF, S_EI):,} had conflicting source records in version 4" if fsum(f, S_CONF, S_EI) else ""])
     s = (f"Inside the project area, eligible locations went from {e4:,} in the {T_V4} to {e8:,} in the {T_V8} "
          f"({change_words(e8 - e4, 'eligible')}). Of the {e4:,}, {kept:,} are still eligible"
-         + (f", {lost}" if lost else "") + "." + (f" New eligible locations: {won}." if won else ""))
+         + (f"; {lost}" if lost else "") + "." + (f" Eligible in version 8 but not before: {won}." if won else ""))
     i8 = tmat(key, cap(T_SUB4)).sum(axis=0)
+    g = lambda st: int(sum(i8.get(x, 0) for x in ([st] if isinstance(st, str) else st)))
     n4 = k["sub4_v4_listed"]
     s += (f" Of the {n4:,} locations in the {T_SUB4}, " + join_parts([
-        f"{i8.get(S_EI, 0):,} are eligible inside the area in the {T_V8}",
-        f"{i8.get(S_NI, 0):,} are not eligible" if i8.get(S_NI, 0) else "",
-        f"{i8.get(S_OUT, 0):,} lie outside the area" if i8.get(S_OUT, 0) else "",
-        f"{i8.get(S_NOT, 0):,} are no longer in the Fabric" if i8.get(S_NOT, 0) else ""]) + ".")
+        f"{g(S_EI):,} are eligible inside the area in the {T_V8}",
+        f"{g(S_NI):,} are not eligible inside the area" if g(S_NI) else "",
+        f"{g(OUT):,} lie outside the area" if g(OUT) else "",
+        f"{g(S_NOT):,} are not in the {T_V8}" if g(S_NOT) else "",
+        f"{g(S_CONF):,} have conflicting source records" if g(S_CONF) else ""]) + ".")
     a4 = tmat(key, "Added in the 2026 data").sum(axis=1)
+    h = lambda st: int(sum(a4.get(x, 0) for x in ([st] if isinstance(st, str) else st)))
+    was = lambda n: "was" if n == 1 else "were"
     r = summary.set_index("project_key").loc[key]
     s += (f" The {qr} keeps {r['s_kept']:,} of them, does not carry over {r['s_dropped']:,} and adds {r['s_added']:,}"
           + (f" (in the {T_V4}: " + join_parts([
-              f"{a4.get(S_EI, 0):,} {'was' if a4.get(S_EI, 0) == 1 else 'were'} already eligible inside the area" if a4.get(S_EI, 0) else "",
-              f"{a4.get(S_NI, 0):,} {'was' if a4.get(S_NI, 0) == 1 else 'were'} not eligible" if a4.get(S_NI, 0) else "",
-              f"{a4.get(S_OUT, 0):,} {'was' if a4.get(S_OUT, 0) == 1 else 'were'} outside the area" if a4.get(S_OUT, 0) else "",
-              f"{a4.get(S_NOT, 0):,} did not exist yet" if a4.get(S_NOT, 0) else ""]) + ")" if r["s_added"] else "")
+              f"{h(S_EI):,} {was(h(S_EI))} already eligible inside the area" if h(S_EI) else "",
+              f"{h(S_NI):,} {was(h(S_NI))} not eligible" if h(S_NI) else "",
+              f"{h(OUT):,} {was(h(OUT))} outside the area" if h(OUT) else "",
+              f"{h(S_NOT):,} {was(h(S_NOT))} not in the Fabric" if h(S_NOT) else "",
+              f"{h(S_CONF):,} had conflicting source records" if h(S_CONF) else ""]) + ")" if r["s_added"] else "")
           + ".")
     return s
 
 
-# ---- change patterns
-P_STABLE, P_SERVICE, P_FEWER, P_MORE, P_IDS, P_DQ = (
-    "Stable", "Eligibility drop from new service", "Fewer planned locations", "More or shifted planned locations",
-    "ID changes", "Data quality")
+# ---- change patterns: analyst-defined review thresholds, each recorded with its count and denominator
+P_NONE, P_SERVICE, P_FEWER, P_MORE, P_IDS, P_DQ = (
+    "No configured material-change threshold triggered", "Listed locations changed to not eligible",
+    "Fewer planned locations", "More or shifted planned locations", "ID changes", "Data validation issues")
+RULE_ROWS: list[dict] = []
 
 
 def big(n: int, base: int, share: float) -> bool:
     return n >= MIN_LOCATIONS and n >= share * base
+
+
+def rule(key: str, pattern: str, name: str, count: int, denom: int, share: float | None, test: bool) -> bool:
+    """Records one review-threshold check (always, triggered or not) and returns whether it was triggered."""
+    RULE_ROWS.append({"project_key": key, "Pattern": pattern, "Review rule": name, "Count": int(count),
+                      "Denominator": int(denom) if denom is not None else None,
+                      "Share (percent)": round(count / denom * 100, 1) if denom else None,
+                      "Threshold": (f"{share:.0%} of the denominator and at least {MIN_LOCATIONS}" if share is not None
+                                    else "any"), "Triggered": "Yes" if test else "No",
+                      "Kind": "Analyst-defined review threshold"})
+    return test
 
 
 def patterns(key: str) -> tuple[list[str], str]:
@@ -1592,42 +1664,59 @@ def patterns(key: str) -> tuple[list[str], str]:
     r = summary.set_index("project_key").loc[key]
     n4, n8 = k["sub4_v4_listed"], k["sub8_v8_listed"]
     found, notes = [], []
-    served = int(tmat(key, cap(T_SUB4)).at[S_EI, S_NI])
-    if big(served, n4, SERVICE_DROP_SHARE):
+    served = fsum(tmat(key, cap(T_SUB4)), S_EI, S_NI)
+    if rule(key, P_SERVICE, "Initial-list locations eligible inside the area in version 4, not eligible in version 8",
+            served, n4, SERVICE_DROP_SHARE, big(served, n4, SERVICE_DROP_SHARE)):
         found.append(P_SERVICE)
-        notes.append(f"{served:,} locations in the {T_SUB4} were eligible inside the area in the {T_V4} and now have "
-                     f"service in the {T_V8}.")
+        notes.append(f"{served:,} of {n4:,} locations in the {T_SUB4} were eligible inside the area in the {T_V4} and "
+                     f"are classified as not eligible in the {T_V8}.")
     dropped_elig = int(plain_b.at[key, "B03"])
-    if (n4 - n8 >= MIN_LOCATIONS and n8 <= (1 - LIST_CHANGE_SHARE) * n4) or big(dropped_elig, n4, DROPPED_ELIGIBLE_SHARE):
+    shorter = rule(key, P_FEWER, "2026 list shorter than the initial list", max(n4 - n8, 0), n4, LIST_CHANGE_SHARE,
+                   n4 - n8 >= MIN_LOCATIONS and n8 <= (1 - LIST_CHANGE_SHARE) * n4)
+    dropped = rule(key, P_FEWER, "Still-eligible locations not carried over", dropped_elig, n4, DROPPED_ELIGIBLE_SHARE,
+                   big(dropped_elig, n4, DROPPED_ELIGIBLE_SHARE))
+    if shorter or dropped:
         found.append(P_FEWER)
         notes.append(f"The {qr} plans {n8:,} locations against {n4:,} in the {T_SUB4}; {dropped_elig:,} still-eligible "
                      "locations were not carried over.")
     outside8 = k["sub8_v8_out_elig"] + k["sub8_v8_out_nelig"]
-    if (n8 - n4 >= MIN_LOCATIONS and n8 >= (1 + LIST_CHANGE_SHARE) * n4) or big(outside8, n8, OUTSIDE_SHARE):
+    longer = rule(key, P_MORE, "2026 list longer than the initial list", max(n8 - n4, 0), n4, LIST_CHANGE_SHARE,
+                  n8 - n4 >= MIN_LOCATIONS and n8 >= (1 + LIST_CHANGE_SHARE) * n4)
+    outside = rule(key, P_MORE, "2026 locations outside the award area", outside8, n8, OUTSIDE_SHARE,
+                   big(outside8, n8, OUTSIDE_SHARE))
+    if longer or outside:
         found.append(P_MORE)
-        notes.append(f"The {qr} plans {n8:,} locations against {n4:,}; {outside8:,} of them lie outside the project "
+        notes.append(f"The {qr} plans {n8:,} locations against {n4:,}; {outside8:,} of {n8:,} lie outside the project "
                      f"area in the {T_V8}.")
     gone = k["sub4_v8_notfound"]
-    if big(gone, n4, ID_CHURN_SHARE):
+    if rule(key, P_IDS, "Initial-list IDs not present in version 8", gone, n4, ID_CHURN_SHARE, big(gone, n4, ID_CHURN_SHARE)):
         found.append(P_IDS)
-        notes.append(f"{gone:,} IDs in the {T_SUB4} are no longer in the {T_V8}.")
+        notes.append(f"{gone:,} of {n4:,} IDs in the {T_SUB4} are not present in the {T_V8}.")
     dq = []
-    if r["sub4_dup_rows"] or r["sub8_dup_rows"]:
-        dq.append(plural(int(r['sub4_dup_rows'] + r['sub8_dup_rows']), "duplicate row"))
-    if r["sub4_bad_rows"] or r["sub8_bad_rows"]:
-        dq.append(plural(int(r['sub4_bad_rows'] + r['sub8_bad_rows']), "row") + " without a valid ID")
-    if k["sub8_v8_notfound"]:
-        dq.append(plural(k['sub8_v8_notfound'], "ID") + f" in the {qr} not in the {T_V8}")
+    dups = int(r["sub4_dup_rows"] + r["sub8_dup_rows"])
+    bad = int(r["sub4_bad_rows"] + r["sub8_bad_rows"])
+    conflicts = k["sub8_v8_conflict"] + k["a_v8_conflict"]
     gaps = k.get("sub4_v4_coord_gap", 0) + k.get("sub8_v8_coord_gap", 0)
     checked = k.get("sub4_v4_coord_checked", 0) + k.get("sub8_v8_coord_checked", 0)
-    if big(gaps, checked, COORD_GAP_SHARE):
-        dq.append(plural(gaps, "grantee coordinate") + f" more than {COORD_GAP_M} m from the Fabric point")
+    if rule(key, P_DQ, "Duplicate rows in the grantee lists", dups, None, None, dups > 0):
+        dq.append(plural(dups, "duplicate row"))
+    if rule(key, P_DQ, "Rows without a valid location ID", bad, None, None, bad > 0):
+        dq.append(plural(bad, "row") + " without a valid location ID")
+    if rule(key, P_DQ, "2026 IDs not present in version 8", k["sub8_v8_notfound"], n8, None, k["sub8_v8_notfound"] > 0):
+        dq.append(plural(k['sub8_v8_notfound'], "ID") + f" in the {qr} not in the {T_V8}")
+    if rule(key, P_DQ, "Conflicting source records (2026 list and project area, version 8)", conflicts, None, None,
+            conflicts > 0):
+        dq.append(plural(conflicts, "ID") + " with conflicting source records")
+    if rule(key, P_DQ, f"Grantee coordinates more than {COORD_GAP_M} m from the Fabric point", gaps, checked,
+            COORD_GAP_SHARE, big(gaps, checked, COORD_GAP_SHARE)):
+        dq.append(f"{gaps:,} of {checked:,} grantee coordinates more than {COORD_GAP_M} m from the Fabric point")
     if dq:
         found.append(P_DQ)
-        notes.append("Data quality: " + join_parts(dq) + ".")
+        notes.append("Data validation: " + join_parts(dq) + ".")
     if not [p for p in found if p != P_DQ]:
-        found.insert(0, P_STABLE)
-        notes.insert(0, "The grantee lists and the eligible locations in the area changed little.")
+        found.insert(0, P_NONE)
+        notes.insert(0, "None of the configured scope or eligibility thresholds was reached; see the Review rules tab "
+                        "for the counts behind each.")
     return found, " ".join(notes)
 
 
@@ -1649,10 +1738,11 @@ for key, k in KEY.items():
             inside_outside = k[p + "in_elig"] + k[p + "in_nelig"] + k[p + "out_elig"] + k[p + "out_nelig"]
             assert inside_outside <= k[p + "matched"], (key, p)
             assert k[p + "out_near"] + k[p + "out_mid"] + k[p + "out_far"] == k[p + "out_elig"] + k[p + "out_nelig"]
-    assert tmat(key, "Fabric locations in the project area").loc[[S_EI]].sum(axis=1).iat[0] == k["a_v4_elig"]
-    assert tmat(key, "Fabric locations in the project area")[S_EI].sum() == k["a_v8_elig"]
+    assert fsum(tmat(key, "Fabric locations in the project area"), S_EI, STATES + [S_NB]) == k["a_v4_elig"]
+    assert fsum(tmat(key, "Fabric locations in the project area"), STATES + [S_NB], S_EI) == k["a_v8_elig"]
     assert k["sub4_v4_listed"] == summary.set_index("project_key").at[key, "sub4_n"]
     assert k["sub8_v8_listed"] == summary.set_index("project_key").at[key, "sub8_n"]
+review_rules = pd.DataFrame(RULE_ROWS)
 display(summary[["project_key", "patterns", "pattern_notes"]])
 
 def fmt_n(v) -> str:
@@ -1676,10 +1766,12 @@ def key_tables(key: str) -> dict[str, pd.DataFrame]:
     rows_a = [("Locations", "loc"), ("Eligible", "elig"), ("Not eligible", "nelig")]
     if HAS_UNITS["v4"] and HAS_UNITS["v8"]:
         rows_a += [("Units at the locations (unit count)", "units"), ("Units at eligible locations", "units_elig")]
-    rows_a += [("Broadband serviceable locations", "bsl"), ("Not broadband serviceable locations", "nonbsl")]
+    rows_a += [("Broadband serviceable locations", "bsl"), ("Not broadband serviceable locations", "nonbsl"),
+               ("Conflicting source records (not counted above)", "conflict")]
     A = pd.DataFrame([{"Fabric locations inside the project area": lab, "Version 4": g(f"a_v4_{m}"),
                        "Version 8": g(f"a_v8_{m}"), "Change": g(f"a_v8_{m}") - g(f"a_v4_{m}")} for lab, m in rows_a])
     rows_b = [("Listed", "listed"), ("Matched to the Fabric", "matched"), ("Not found in the Fabric", "notfound"),
+              ("Conflicting source records", "conflict"),
               ("Inside the area – eligible", "in_elig"), ("Inside the area – not eligible", "in_nelig"),
               ("Outside the area – eligible", "out_elig"), ("Outside the area – not eligible", "out_nelig"),
               ("Outside: under 100 m", "out_near"), ("Outside: 100 m to 1 km", "out_mid"), ("Outside: over 1 km", "out_far"),
@@ -1725,7 +1817,7 @@ FIELD_GUIDE = {
     "elig_chg": ("change_in_eligible_in_area", "Change in eligible locations in the project area (version 8 minus version 4)"),
     "total_pct": ("percent_change_locations_in_area", "Percent change in locations in the project area"),
     "elig_pct": ("percent_change_eligible_in_area", "Percent change in eligible locations in the project area"),
-    "f_elig_lost": ("area_lost_eligibility", "Locations in the area that lost eligibility (now have service)"),
+    "f_elig_lost": ("area_lost_eligibility", "Locations in the area whose classification changed from eligible to not eligible"),
     "f_elig_gain": ("area_became_eligible", "Locations in the area that became eligible"),
     "f_retired": ("area_ids_removed_in_version_8", "IDs in the area that are not in Fabric version 8"),
     "f_new": ("area_new_ids_in_version_8", "IDs in the area that are new in Fabric version 8"),
@@ -1744,8 +1836,8 @@ FIELD_GUIDE = {
     "s_dropped": ("not_carried_into_2026_data", f"Locations not carried into the {SUB8}"),
     "s_added": ("new_in_2026_data", f"Locations new in the {SUB8}"),
     "x_retired": ("not_carried_id_not_in_version_8", "Not carried over because the ID is not in Fabric version 8"),
-    "x_served": ("listed_locations_now_served", "Listed or not-carried-over locations that now have service"),
-    "x_applicant": ("changes_not_explained_by_fabric", "List changes the Fabric update does not explain (grantee decisions)"),
+    "x_served": ("listed_locations_now_not_eligible", "Listed or not-carried-over locations whose classification changed from eligible to not eligible"),
+    "x_applicant": ("changes_not_explained_by_fabric", "List changes not explained by observed Fabric change"),
     "x_new_fabric": ("added_new_in_version_8", "Added locations that are new in Fabric version 8"),
     "sub8_not_elig": ("data_2026_not_eligible_version_8", f"{SUB8} – not eligible in Fabric version 8"),
     "v4_elig_in_area": ("synthesis_version_4_eligible_in_area", "Coverage: eligible locations in the area (version 4)"),
@@ -1764,8 +1856,10 @@ FIELD_GUIDE = {
     "pattern_notes": ("change_pattern_notes", "Change pattern notes"),
     "story_why": ("how_the_change_came_together", "How the change came together"),
 }
-FU_NAMES = {"B01": "follow_up_2026_outside_area_or_not_in_version_8", "B02": "follow_up_2026_not_eligible_version_8",
-            "B03": "follow_up_not_carried_over_still_eligible", "B04": "follow_up_new_already_eligible_version_4"}
+FU_NAMES = {"B01": "follow_up_2026_not_in_version_8", "B13": "follow_up_2026_outside_area",
+            "B02": "follow_up_2026_not_eligible_version_8", "B14": "follow_up_2026_not_serviceable_location",
+            "B03": "follow_up_not_carried_over_still_eligible", "B04": "follow_up_new_already_eligible_version_4",
+            "B12": "follow_up_conflicting_source_records"}
 for c_ in FOLLOW_UP_CLASSES:
     FIELD_GUIDE[f"fu_{c_.lower()}"] = (FU_NAMES[c_], "Needs follow-up – " + SUB_CLASSES[c_][0].replace(T_SUB8_SHORT, SUB8))
 for pre, (fname, lab) in {"sub4": ("initial_submission", SUB4), "sub8": ("data_2026", SUB8),
@@ -1777,9 +1871,11 @@ for pre, (fname, lab) in {"sub4": ("initial_submission", SUB4), "sub8": ("data_2
 # Key numbers (section 6a)
 A_NAMES = {"loc": ("locations", "locations"), "elig": ("eligible", "eligible"), "nelig": ("not_eligible", "not eligible"),
            "units": ("units", "units at the locations (unit count)"), "units_elig": ("units_at_eligible", "units at eligible locations"),
-           "bsl": ("serviceable", "broadband serviceable locations"), "nonbsl": ("not_serviceable", "not broadband serviceable locations")}
+           "bsl": ("serviceable", "broadband serviceable locations"), "nonbsl": ("not_serviceable", "not broadband serviceable locations"),
+           "conflict": ("conflicting_records", "conflicting source records (left out of the counts)")}
 B_NAMES = {"listed": ("listed", "listed"), "matched": ("matched", "matched to the Fabric"),
            "notfound": ("not_found", "not found in the Fabric"), "units": ("units", "units at matched locations"),
+           "conflict": ("conflicting_records", "conflicting source records"),
            "in_elig": ("inside_eligible", "inside the area, eligible"),
            "in_nelig": ("inside_not_eligible", "inside the area, not eligible"),
            "out_elig": ("outside_eligible", "outside the area, eligible"),
@@ -1938,78 +2034,112 @@ assert density.groupby("project_key")["locations"].sum().reindex(list(PROJECTS),
     .reindex(list(PROJECTS), fill_value=0)), "density cells do not account for every shaded location"
 
 # %% [markdown]
-# ## 6b. Why each location changed, what to do about it, and how sure the analysis is
+# ## 6b. What changed, how it fits the observed Fabric change, and what to review
 #
-# **Scope change.** Retained, removed and added locations, net change, gross turnover (removed + added) and turnover
-# rate ((removed + added) ÷ initial locations). The rate can pass 100 % when most of a list is replaced. Net change is
-# never reported without gross turnover.
+# Three kinds of output are kept apart: **source facts** (what the lists and the Fabric files contain), **analytical
+# interpretations** (what the rules below read from those facts) and **analyst decisions** (blank columns for the
+# analyst). An interpretation says whether a change is *consistent with* the observed Fabric change; it never states
+# the cause.
 #
-# **Eligibility change.** Stable eligible, stable served, eligible → served, served → eligible, eligible IDs removed,
-# new eligible IDs, eligible points moved out of or into the area. Gross loss + gross gain reconcile the version 4
-# eligible total to the version 8 total.
+# **Source facts per listed location** are separate fields, never merged: present in the Fabric, inside the award
+# area, eligible, broadband serviceable location, and conflicting source records, each for version 4 and version 8,
+# plus whether the location is in each grantee list. "Not eligible" means the eligibility classification is not
+# eligible; it is not read as "now has service".
 #
-# **Cause of every added or removed location** (retained locations are not part of this count):
+# **Conflicting source records.** When copies of one location ID in a Fabric file disagree on eligibility, the ID is
+# marked as conflicting, left out of every eligibility count, reported as an unresolved count, and never resolved in
+# favour of eligibility.
+#
+# **Three review dimensions per location:** list continuity (Retained / Removed / Added), current status (Acceptable /
+# Review required / Not on the current list) and the observed Fabric transition. Retained does not mean no action.
+#
+# **Scope change.** Retained, removed and added, net change, gross turnover (removed + added) and turnover rate
+# (turnover ÷ initial locations; it can pass 100 %).
+#
+# **Eligibility change.** Eligible in both versions, not eligible in both, eligible → not eligible, not eligible →
+# eligible, eligible IDs present only in version 4 or only in version 8, eligible points moved out of or into the
+# area, and moves to or from conflicting records or non-serviceable status. Gross loss and gross gain reconcile the
+# version 4 eligible total to the version 8 total.
+#
+# **Observed explanation of each added or removed location** (with its percent of gross turnover):
 #
 # | Class | When |
 # |---|---|
-# | Explained by the Fabric update | Removed: ID not in version 8, point moved out, or now served. Added: new ID in version 8, point moved in, or became eligible |
-# | Grantee-driven or not explained by the Fabric | Removed although still eligible inside the area; added although already eligible in version 4, not eligible, or outside the area |
-# | Data-quality issue | The ID is missing from the Fabric version it should be in (initial list: version 4; 2026 data: version 8) |
-# | Unresolved | The ID is in neither Fabric version, so the cause cannot be determined |
+# | Consistent with Fabric change | Removed: ID present only in version 4, point now outside, or eligible → not eligible. Added: ID present only in version 8, point moved in, or not eligible → eligible |
+# | Not explained by observed Fabric change | Removed although still eligible inside the area; added although already eligible in version 4, not eligible, or outside the area |
+# | Data validation issue | Conflicting source records, or the ID is missing from the Fabric version it belongs to |
+# | Indeterminate | The ID is in neither Fabric version |
 #
-# **Follow-up flags** (any listed location; one row per flag in the follow-up list):
+# **Flags, in priority order** (every flag is recorded: *All flags*, *All recommended actions*; the first gives
+# *Priority*, *Priority reason* and *Primary action*):
 #
-# | Flag | Recommended action |
-# |---|---|
-# | In the 2026 data but outside the awarded area | Verify boundary |
-# | In the 2026 data but not eligible | Verify eligibility |
-# | In the 2026 data but missing from the current Fabric | Correct data |
-# | Removed from the submission but still eligible inside the area | Confirm scope change |
-# | Added without a Fabric-based explanation (already eligible in version 4) | Confirm scope change |
-# | Grantee coordinates more than `COORD_GAP_M` m from the Fabric point | Correct data |
+# | Priority | Flag | Action |
+# |---|---|---|
+# | 1 | Current location ID not found in Fabric version 8 | Correct data |
+# | 2 | Current Fabric point outside the award area | Verify boundary |
+# | 3 | Current location not eligible in Fabric version 8 | Verify eligibility |
+# | 4 | Current record not a broadband serviceable location | Verify eligibility |
+# | 5 | Removed but still eligible inside the area | Confirm scope change |
+# | 6 | Added without an observed Fabric transition | Confirm scope change |
+# | 7 | Conflicting source records | Correct data |
+# | 7 | Grantee coordinates more than `COORD_GAP_M` m from the Fabric point (data validation) | Correct data |
 #
-# The first five are the locations that **need follow-up** (they match the categories on the follow-up map); the
-# coordinate flag is a **data correction**. Locations without a flag get *Document change* (added or removed and
-# explained) or *No action* (retained).
+# Priorities 1–7 except the coordinate flag are the locations that **need follow-up** and match the follow-up map.
 #
-# **Confidence.** *High*: the ID is in both Fabric versions and the point is more than `EDGE_M` m from the boundary.
-# *Medium*: the ID is in only one version, so the cause rests on its absence from the other. *Low*: the ID is in
-# neither version, the point is within `EDGE_M` m of the boundary, or the grantee's coordinates are more than
-# `COORD_GAP_M` m from the Fabric point.
+# **Evidence strength** describes the evidence, not certainty about a conclusion. *Strong*: exact ID in both Fabric
+# versions. *Moderate*: exact ID in one version only. *Limited*: ID in neither version, within `EDGE_M` m of the
+# boundary, a coordinate discrepancy, or conflicting source records. Each basis is its own Yes/No field.
 #
-# **Spatial findings.** Inside / outside and near-boundary counts, points moved into or out of the area, point
-# displacement between versions (median and maximum for points that moved), distance from the grantee's coordinates to
-# the Fabric point (median and maximum), and concentration: the share of additions, removals, eligibility changes and
-# follow-up locations that sit in the busiest 10 % of the `CONCENTRATION_CELL_M` m hexagons they occupy (50 % or more is
-# reported as concentrated). Moved coordinates are FCC map edits, not buildings that moved.
+# **Current exceptions** (2026 data against Fabric version 8): IDs not found, outside, not eligible, not serviceable
+# locations, conflicting records, coordinate discrepancies, locations with more than one issue, locations usable after
+# data validation (eligible inside, only a data issue) and acceptable locations. **Coverage rate** is reported with its
+# numerator and denominator, by locations and by units.
+#
+# **Spatial findings.** Near-boundary counts, points moved into or out of the area, point displacement (median, 95th
+# percentile, maximum), grantee coordinate gaps (count, rate, median, 95th percentile, maximum) and concentration
+# (share in the busiest 10 % of `CONCENTRATION_CELL_M` m hexagons). Moved coordinates are map coordinate edits.
+#
+# **Five determinations per project:** scope change, eligibility change, observed explanation, current exceptions and
+# analyst disposition (suggested: Accept and document, Request clarification, Request corrected data, or Further
+# review), each with a blank *Analyst decision* column.
+#
+# **Review rules.** The change-pattern thresholds are analyst-defined review thresholds set in the notebook settings.
+# Every check is recorded with its count, denominator, share, threshold and whether it was triggered. When none is
+# triggered the pattern reads "No configured material-change threshold triggered".
 
 # %%
 CONCENTRATION_CELL_M = 400       # hexagon size (circumradius, metres) for geographic concentration
 CONCENTRATION_TOP = 0.10         # busiest share of occupied hexagons
 CONCENTRATED_SHARE = 0.50        # share of locations in the busiest hexagons that counts as concentrated
 
-C_EXPLAINED, C_GRANTEE, C_DQ, C_UNRESOLVED, C_RETAINED = (
-    "Explained by the Fabric update", "Grantee-driven or not explained by the Fabric", "Data-quality issue",
-    "Unresolved", "Retained (not a list change)")
-CLASSES = [C_EXPLAINED, C_GRANTEE, C_DQ, C_UNRESOLVED]
+C_CONSISTENT, C_NOT_EXPLAINED, C_VALIDATION, C_INDETERMINATE, C_RETAINED = (
+    "Consistent with Fabric change", "Not explained by observed Fabric change", "Data validation issue",
+    "Indeterminate", "Retained (in both lists)")
+CLASSES = [C_CONSISTENT, C_NOT_EXPLAINED, C_VALIDATION, C_INDETERMINATE]
 A_NONE, A_DOC, A_ELIG, A_BOUNDARY, A_SCOPE, A_DATA = (
     "No action", "Document change", "Verify eligibility", "Verify boundary", "Confirm scope change", "Correct data")
-FLAGS = {   # code: (issue, action, question)
-    "outside": ("In the 2026 data but outside the awarded area", A_BOUNDARY,
-                "Why is a location outside the awarded area in the 2026 data?"),
-    "not_eligible": ("In the 2026 data but not eligible in Fabric version 8", A_ELIG,
-                     "How does a location that Fabric version 8 shows as served qualify?"),
-    "missing": ("In the 2026 data but missing from Fabric version 8", A_DATA,
-                "What is the Fabric version 8 location ID for this location?"),
+K_FU, K_DV = "Needs follow-up", "Data validation"
+FLAGS = {   # code: (issue, action, question, priority (1 = first), kind)
+    "missing": ("Current location ID not found in Fabric version 8", A_DATA,
+                "What is the Fabric version 8 location ID for this location?", 1, K_FU),
+    "outside": ("Current Fabric point outside the award area", A_BOUNDARY,
+                "Why is a location outside the awarded area in the 2026 data?", 2, K_FU),
+    "not_eligible": ("Current location not eligible in Fabric version 8", A_ELIG,
+                     "How does a location classified as not eligible in Fabric version 8 qualify?", 3, K_FU),
+    "not_bsl": ("Current record not a broadband serviceable location", A_ELIG,
+                "Is this location a broadband serviceable location?", 4, K_FU),
     "dropped_eligible": ("Removed from the submission but still eligible inside the area", A_SCOPE,
-                         "Why was this eligible location taken off the planned list?"),
-    "added_unexplained": ("Added without a Fabric-based explanation (already eligible in version 4)", A_SCOPE,
-                          "Why was this already-eligible location not in the initial grantee submission?"),
-    "coordinates": (f"Grantee coordinates more than {COORD_GAP_M} m from the Fabric point", A_DATA,
-                    "Please confirm the location; the coordinates you reported are far from the FCC point."),
+                         "Why was this eligible location taken off the planned list?", 5, K_FU),
+    "added_unexplained": ("Added without an observed Fabric transition (already eligible in version 4)", A_SCOPE,
+                          "Why was this already-eligible location not in the initial grantee submission?", 6, K_FU),
+    "conflict": ("Conflicting source records in the Fabric", A_DATA,
+                 "Which record is right for this location? The Fabric copies disagree on eligibility.", 7, K_FU),
+    "coordinates": (f"Current coordinate discrepancy (over {COORD_GAP_M} m)", A_DATA,
+                    "Please confirm the location; the coordinates you reported are far from the FCC point.", 7, K_DV),
 }
-FOLLOW_UP_FLAGS = ["outside", "not_eligible", "missing", "dropped_eligible", "added_unexplained"]
-ST_OUTSIDE = {ST_ELIG_OUT, ST_NOT_ELIG_OUT, ST_NOT_BSL}
+FLAG_ORDER = sorted(FLAGS, key=lambda f_: FLAGS[f_][3])
+FOLLOW_UP_FLAGS = [f_ for f_ in FLAG_ORDER if FLAGS[f_][4] == K_FU]
+ST_OUT = {ST_ELIG_OUT, ST_NOT_ELIG_OUT}
 
 
 def grantee_gap_m(sub: pd.DataFrame, v: str) -> pd.Series:
@@ -2025,10 +2155,17 @@ def grantee_gap_m(sub: pd.DataFrame, v: str) -> pd.Series:
     return out
 
 
-# ---- per listed location: cause class, flags, action, confidence, evidence
+# ---- per listed location: separate source facts first, then interpretations
 s4, s8 = subs["fabric_status_v4"], subs["fabric_status_v8"]
 chg = subs["sub_change"]
 lid = subs["location_id"].astype("int64")
+for v in ("v4", "v8"):                       # source facts, one field per dimension
+    a = attrs[v].reindex(lid)
+    subs[f"present_in_fabric_{v}"] = a["lon"].notna().to_numpy() | lid.isin(attrs[v].index).to_numpy()
+    subs[f"inside_award_area_{v}"] = [i in area_sets[v].get(k, set()) for k, i in zip(subs["project_key"], lid)]
+    subs[f"conflicting_records_{v}"] = a["conflict"].fillna(False).astype(bool).to_numpy()
+    subs[f"eligible_{v}"] = (a["eligible"].fillna(False).astype(bool) & ~a["conflict"].fillna(False).astype(bool)).to_numpy()
+    subs[f"broadband_serviceable_{v}"] = a["bsl"].fillna(False).astype(bool).to_numpy()
 gap4 = pd.concat([grantee_gap_m(sub_v4[sub_v4["project_key"] == k], "v4").rename(k) for k in PROJECTS], axis=1)
 gap8 = pd.concat([grantee_gap_m(sub_v8[sub_v8["project_key"] == k], "v8").rename(k) for k in PROJECTS], axis=1)
 subs["grantee_gap_v4_m"] = [gap4.at[i, k] if i in gap4.index and v else np.nan
@@ -2037,43 +2174,63 @@ subs["grantee_gap_v8_m"] = [gap8.at[i, k] if i in gap8.index and v else np.nan
                             for k, i, v in zip(subs["project_key"], lid, subs["in_sub_v8"])]
 subs["grantee_gap_m"] = subs[["grantee_gap_v4_m", "grantee_gap_v8_m"]].max(axis=1)
 
+# Cause of each list change (association with the observed Fabric change, not proof of cause)
 neither = s4.eq(ST_NOT_IN) & s8.eq(ST_NOT_IN)
+conflict_any = s4.eq(ST_CONFLICT) | s8.eq(ST_CONFLICT)
 removed, added = chg.eq(SC_DROPPED), chg.eq(SC_ADDED)
-subs["cause_class"] = np.select(
-    [~(removed | added), neither,
-     removed & s4.eq(ST_NOT_IN), removed & (s8.eq(ST_NOT_IN) | s8.isin(ST_OUTSIDE) | s8.eq(ST_NOT_ELIG)),
-     removed & s8.eq(ST_ELIG),
-     added & s8.eq(ST_NOT_IN), added & s8.eq(ST_ELIG) & (s4.eq(ST_NOT_IN) | s4.isin(ST_OUTSIDE) | s4.eq(ST_NOT_ELIG))],
-    [C_RETAINED, C_UNRESOLVED, C_DQ, C_EXPLAINED, C_GRANTEE, C_DQ, C_EXPLAINED], default=C_GRANTEE)
-subs["cause_reason"] = np.select(
-    [~(removed | added), neither,
-     removed & s4.eq(ST_NOT_IN), removed & s8.eq(ST_NOT_IN), removed & s8.isin(ST_OUTSIDE),
-     removed & s8.eq(ST_NOT_ELIG), removed & s8.eq(ST_ELIG),
-     added & s8.eq(ST_NOT_IN), added & s8.isin(ST_OUTSIDE), added & s8.eq(ST_NOT_ELIG),
-     added & s4.eq(ST_NOT_IN), added & s4.isin(ST_OUTSIDE), added & s4.eq(ST_NOT_ELIG)],
-    ["In both lists", "Location ID in neither Fabric version",
-     "Initial ID not in Fabric version 4", "ID not in Fabric version 8", "Point moved out of the area",
-     "Now served (eligibility change)", "Still eligible inside the area (unexplained scope change)",
-     "ID not in Fabric version 8", "Added outside the area (unexplained scope change)",
-     "Added although not eligible (unexplained scope change)",
-     "New ID in Fabric version 8", "Point moved into the area", "Became eligible (eligibility change)"],
-    default="Already eligible in Fabric version 4 (unexplained scope change)")
+cause_rules = [
+    (~(removed | added), C_RETAINED, "In both lists"),
+    (neither, C_INDETERMINATE, "Location ID in neither Fabric version"),
+    (conflict_any, C_VALIDATION, "Conflicting source records in the Fabric"),
+    (removed & s4.eq(ST_NOT_IN), C_VALIDATION, "Initial ID not present in Fabric version 4"),
+    (removed & s8.eq(ST_NOT_IN), C_CONSISTENT, "ID present only in Fabric version 4"),
+    (removed & s8.isin(ST_OUT), C_CONSISTENT, "Point now outside the area"),
+    (removed & s8.isin([ST_NOT_ELIG, ST_NOT_BSL]), C_CONSISTENT, "Eligible to not eligible"),
+    (removed & s8.eq(ST_ELIG), C_NOT_EXPLAINED, "Still eligible inside the area"),
+    (added & s8.eq(ST_NOT_IN), C_VALIDATION, "ID not present in Fabric version 8"),
+    (added & s8.isin(ST_OUT), C_NOT_EXPLAINED, "Added outside the area"),
+    (added & s8.isin([ST_NOT_ELIG, ST_NOT_BSL]), C_NOT_EXPLAINED, "Added although not eligible"),
+    (added & s4.eq(ST_NOT_IN), C_CONSISTENT, "ID present only in Fabric version 8"),
+    (added & s4.isin(ST_OUT), C_CONSISTENT, "Point moved into the area"),
+    (added & s4.isin([ST_NOT_ELIG, ST_NOT_BSL]), C_CONSISTENT, "Not eligible to eligible"),
+]
+subs["cause_class"] = np.select([c for c, _, _ in cause_rules], [k for _, k, _ in cause_rules], default=C_NOT_EXPLAINED)
+subs["cause_reason"] = np.select([c for c, _, _ in cause_rules], [w for _, _, w in cause_rules],
+                                 default="Already eligible in Fabric version 4")
 
+# Flags: every issue is recorded; nothing is hidden behind the first one
 in8 = subs["in_sub_v8"]
-flag_cols = {"outside": in8 & s8.isin(ST_OUTSIDE), "not_eligible": in8 & s8.eq(ST_NOT_ELIG),
-             "missing": in8 & s8.eq(ST_NOT_IN), "dropped_eligible": removed & s8.eq(ST_ELIG),
-             "added_unexplained": added & s4.eq(ST_ELIG),
+not_bsl = in8 & non_bsl8
+flag_cols = {"missing": in8 & s8.eq(ST_NOT_IN), "outside": in8 & s8.isin(ST_OUT),
+             "not_eligible": in8 & s8.isin([ST_NOT_ELIG, ST_NOT_ELIG_OUT]), "not_bsl": not_bsl,
+             "dropped_eligible": removed & s8.eq(ST_ELIG), "added_unexplained": added & s4.eq(ST_ELIG),
+             "conflict": (in8 & s8.eq(ST_CONFLICT)) | ((removed | added) & conflict_any),
              "coordinates": subs["grantee_gap_m"].gt(COORD_GAP_M)}
-for f, m in flag_cols.items():
-    subs[f"flag_{f}"] = m.fillna(False).to_numpy()
-subs["needs_follow_up_flag"] = subs[[f"flag_{f}" for f in FOLLOW_UP_FLAGS]].any(axis=1)
-subs["data_correction_flag"] = subs["flag_coordinates"]
-subs["flags"] = subs.apply(lambda r: "; ".join(FLAGS[f][0] for f in FLAGS if r[f"flag_{f}"]), axis=1)
-subs["recommended_action"] = subs.apply(
-    lambda r: next((FLAGS[f][1] for f in FLAGS if r[f"flag_{f}"]),
-                   A_DOC if r["cause_class"] != C_RETAINED else A_NONE), axis=1)
+for f_, m in flag_cols.items():
+    subs[f"flag_{f_}"] = m.fillna(False).to_numpy()
+subs["needs_follow_up_flag"] = subs[[f"flag_{f_}" for f_ in FOLLOW_UP_FLAGS]].any(axis=1)
+subs["data_validation_flag"] = subs[[f"flag_{f_}" for f_ in FLAG_ORDER if FLAGS[f_][4] == K_DV]].any(axis=1)
+subs["flag_count"] = subs[[f"flag_{f_}" for f_ in FLAGS]].sum(axis=1)
+on = lambda r: [f_ for f_ in FLAG_ORDER if r[f"flag_{f_}"]]
+subs["all_flags"] = subs.apply(lambda r: "; ".join(FLAGS[f_][0] for f_ in on(r)), axis=1)
+subs["all_recommended_actions"] = subs.apply(lambda r: "; ".join(dict.fromkeys(FLAGS[f_][1] for f_ in on(r))), axis=1)
+subs["priority"] = subs.apply(lambda r: FLAGS[on(r)[0]][3] if on(r) else np.nan, axis=1)
+subs["priority_reason"] = subs.apply(lambda r: FLAGS[on(r)[0]][0] if on(r) else "", axis=1)
+subs["primary_action"] = subs.apply(
+    lambda r: FLAGS[on(r)[0]][1] if on(r) else (A_DOC if r["cause_class"] != C_RETAINED else A_NONE), axis=1)
+subs["questions"] = subs.apply(lambda r: " ".join(dict.fromkeys(FLAGS[f_][2] for f_ in on(r))), axis=1)
 
-# Confidence: how firmly the Fabric evidence supports the classification
+# Three separate review dimensions: list continuity, current compliance, observed Fabric transition
+subs["list_continuity"] = chg.map({SC_KEPT: "Retained", SC_DROPPED: "Removed", SC_ADDED: "Added"})
+subs["current_status"] = np.where(~in8, "Not on the current list",
+                                  np.where(s8.eq(ST_ELIG) & subs["flag_count"].eq(0), "Acceptable", "Review required"))
+subs["usable_after_validation"] = in8 & s8.eq(ST_ELIG) & ~subs["needs_follow_up_flag"] & subs["data_validation_flag"]
+subs["fabric_transition"] = np.select(
+    [conflict_any, neither, s8.eq(ST_NOT_IN), s4.eq(ST_NOT_IN), s4.ne(s8)],
+    ["Conflicting source records", "In neither version", "ID present only in Fabric version 4",
+     "ID present only in Fabric version 8", "Status or geography changed"], default="No observed change")
+
+# Evidence strength (quality of the evidence, not certainty that a conclusion is right), with its basis
 cur_v = np.where(in8, "v8", "v4")
 edge = pd.Series(np.inf, index=subs.index)
 for key in PROJECTS:
@@ -2086,9 +2243,15 @@ for key in PROJECTS:
             pts = gpd.GeoSeries(gpd.points_from_xy(a["lon"][ok], a["lat"][ok]), crs=WGS84).to_crs(METRIC_CRS)
             edge.loc[subs.index[m][ok]] = pts.distance(bnd).to_numpy()
 subs["distance_to_boundary_m"] = edge.replace(np.inf, np.nan).round(1)
-in_both = ~s4.eq(ST_NOT_IN) & ~s8.eq(ST_NOT_IN)
-low = neither | subs["distance_to_boundary_m"].le(EDGE_M) | subs["flag_coordinates"]
-subs["confidence"] = np.where(low, "Low", np.where(in_both, "High", "Medium"))
+subs["basis_exact_id_both_versions"] = ~s4.eq(ST_NOT_IN) & ~s8.eq(ST_NOT_IN)
+subs["basis_exact_id_one_version"] = s4.eq(ST_NOT_IN) ^ s8.eq(ST_NOT_IN)
+subs["basis_boundary_sensitive"] = subs["distance_to_boundary_m"].le(EDGE_M)
+subs["basis_coordinate_discrepancy"] = subs["flag_coordinates"]
+subs["basis_conflicting_records"] = conflict_any
+limited = (neither | subs["basis_boundary_sensitive"] | subs["basis_coordinate_discrepancy"]
+           | subs["basis_conflicting_records"])
+subs["evidence_strength"] = np.where(limited, "Limited",
+                                     np.where(subs["basis_exact_id_both_versions"], "Strong", "Moderate"))
 
 
 def evidence(r: pd.Series) -> str:
@@ -2096,6 +2259,8 @@ def evidence(r: pd.Series) -> str:
              f"Fabric version 8: {STATUS_PLAIN[r['fabric_status_v8']].lower()}",
              "in both lists" if r["in_sub_v4"] and r["in_sub_v8"] else
              ("only in the initial grantee submission" if r["in_sub_v4"] else "only in the 2026 data")]
+    if r["in_sub_v8"] and not r["broadband_serviceable_v8"] and r["present_in_fabric_v8"]:
+        parts.append("not a broadband serviceable location in version 8")
     if pd.notna(r["distance_to_boundary_m"]) and r["distance_to_boundary_m"] <= EDGE_M:
         parts.append(f"{r['distance_to_boundary_m']:.0f} m from the boundary")
     if pd.notna(r["grantee_gap_m"]) and r["grantee_gap_m"] > COORD_GAP_M:
@@ -2105,7 +2270,7 @@ def evidence(r: pd.Series) -> str:
 
 subs["evidence"] = subs.apply(evidence, axis=1)
 
-# Every location the follow-up map shows is flagged, and nothing else is
+# Every location the follow-up map shows is flagged for follow-up, and nothing else is
 assert subs["needs_follow_up_flag"].equals(subs["needs_follow_up"].astype(bool)), "follow-up flags differ from the map"
 
 
@@ -2131,49 +2296,90 @@ def pct_of(n: float, d: float) -> float:
     return round(n / d * 100, 1) if d else np.nan
 
 
+CAUSE_NAMES = dict(zip(("consistent", "not_explained", "validation", "indeterminate"), CLASSES))
+DISPOSITIONS = ("Accept and document", "Request clarification", "Request corrected data", "Further review")
+
+
+def p95(s: pd.Series) -> float:
+    s = s.dropna()
+    return round(float(s.quantile(0.95)), 1) if len(s) else np.nan
+
+
+DETERMINATIONS: dict[str, list[dict]] = {}
 for key in PROJECTS:
     k = KEY[key]
     sb = subs[subs["project_key"] == key]
+    cur = sb[sb["in_sub_v8"]]
     ch = changes[changes["project_key"] == key]
     f = tmat(key, "Fabric locations in the project area")
-    cell = lambda a, b: int(f.at[a, b]) if a in f.index and b in f.columns else 0
     # Scope change
     k["turn_retained"], k["turn_removed"], k["turn_added"] = (int(sb["sub_change"].eq(c).sum())
                                                             for c in (SC_KEPT, SC_DROPPED, SC_ADDED))
     k["turn_net"] = k["turn_added"] - k["turn_removed"]
     k["turn_gross"] = k["turn_added"] + k["turn_removed"]
     k["turn_rate"] = pct_of(k["turn_gross"], k["sub4_v4_listed"])
-    # Eligibility change, reconciled
-    k["e_stable_eligible"], k["e_stable_served"] = cell(S_EI, S_EI), cell(S_NI, S_NI)
-    k["e_to_served"], k["e_to_eligible"] = cell(S_EI, S_NI), cell(S_NI, S_EI)
-    k["e_removed"], k["e_new"] = cell(S_EI, S_NOT), cell(S_NOT, S_EI)
-    k["e_moved_out"], k["e_moved_in"] = cell(S_EI, S_OUT), cell(S_OUT, S_EI)
-    k["e_gross_loss"] = k["e_to_served"] + k["e_removed"] + k["e_moved_out"]
-    k["e_gross_gain"] = k["e_to_eligible"] + k["e_new"] + k["e_moved_in"]
+    # Eligibility change, reconciled (conflicting source records are a separate state, never counted as eligible)
+    k["e_stable_eligible"], k["e_stable_not_eligible"] = fsum(f, S_EI, S_EI), fsum(f, S_NI, S_NI)
+    k["e_to_not_eligible"], k["e_to_eligible"] = fsum(f, S_EI, S_NI), fsum(f, S_NI, S_EI)
+    k["e_removed"], k["e_new"] = fsum(f, S_EI, S_NOT), fsum(f, S_NOT, S_EI)
+    k["e_moved_out"], k["e_moved_in"] = fsum(f, S_EI, OUT), fsum(f, OUT, S_EI)
+    k["e_to_conflict"], k["e_from_conflict"] = fsum(f, S_EI, S_CONF), fsum(f, S_CONF, S_EI)
+    k["e_to_non_bsl"], k["e_from_non_bsl"] = fsum(f, S_EI, S_NB), fsum(f, S_NB, S_EI)
+    k["e_gross_loss"] = (k["e_to_not_eligible"] + k["e_removed"] + k["e_moved_out"] + k["e_to_conflict"]
+                         + k["e_to_non_bsl"])
+    k["e_gross_gain"] = (k["e_to_eligible"] + k["e_new"] + k["e_moved_in"] + k["e_from_conflict"]
+                         + k["e_from_non_bsl"])
     k["e_net"] = k["e_gross_gain"] - k["e_gross_loss"]
     assert k["a_v4_elig"] + k["e_net"] == k["a_v8_elig"], f"{key}: eligible totals do not reconcile"
-    # Cause classes of list changes
+    # Observed explanation of list changes, with the percent of gross turnover in each class
     changed = sb[sb["cause_class"] != C_RETAINED]
-    for c, name in zip(CLASSES, ("explained", "grantee", "data_quality", "unresolved")):
+    for name, c in CAUSE_NAMES.items():
         k[f"cause_{name}"] = int(changed["cause_class"].eq(c).sum())
-        k[f"cause_{name}_rate"] = pct_of(k[f"cause_{name}"], len(changed))
-    # Flags, follow-up, confidence
+        k[f"cause_{name}_rate"] = pct_of(k[f"cause_{name}"], k["turn_gross"])
+    # Flags, follow-up, evidence strength
     for fl in FLAGS:
         k[f"flag_{fl}"] = int(sb[f"flag_{fl}"].sum())
     k["follow_up_locations"] = int(sb["needs_follow_up_flag"].sum())
-    k["data_correction_locations"] = int(sb["data_correction_flag"].sum())
-    for c in ("High", "Medium", "Low"):
-        k[f"confidence_{c.lower()}"] = int(sb["confidence"].eq(c).sum())
+    k["data_validation_locations"] = int(sb["data_validation_flag"].sum())
+    for c in ("Strong", "Moderate", "Limited"):
+        k[f"evidence_{c.lower()}"] = int(sb["evidence_strength"].eq(c).sum())
+    # Current exceptions (the 2026 data against Fabric version 8)
+    k["cur_listed"] = len(cur)
+    k["cur_not_found"] = int(cur["flag_missing"].sum())
+    k["cur_outside"] = int(cur["flag_outside"].sum())
+    k["cur_not_eligible"] = int(cur["flag_not_eligible"].sum())
+    k["cur_non_bsl"] = int(cur["flag_not_bsl"].sum())
+    k["cur_conflict"] = int(cur["fabric_status_v8"].eq(ST_CONFLICT).sum())
+    k["cur_coordinates"] = int(cur["flag_coordinates"].sum())
+    k["cur_multiple"] = int(cur["flag_count"].ge(2).sum())
+    k["cur_acceptable"] = int(cur["current_status"].eq("Acceptable").sum())
+    k["cur_review"] = int(cur["current_status"].eq("Review required").sum())
+    k["cur_usable_after_validation"] = int(cur["usable_after_validation"].sum())
+    # Coverage: eligible locations inside the area that the 2026 data includes, as numerator and denominator
+    k["cov_numerator"], k["cov_denominator"] = k["sub8_v8_in_elig"], k["a_v8_elig"]
+    k["cov_rate"] = pct_of(k["cov_numerator"], k["cov_denominator"])
+    if HAS_UNITS["v8"]:
+        ids = cur.loc[cur["fabric_status_v8"].eq(ST_ELIG), "location_id"].astype("int64")
+        k["cov_units_numerator"] = int(attrs["v8"]["units"].reindex(ids).fillna(0).sum())
+        k["cov_units_denominator"] = int(k.get("a_v8_units_elig", 0))
+        k["cov_units_rate"] = pct_of(k["cov_units_numerator"], k["cov_units_denominator"])
+    else:
+        k["cov_units_numerator"] = k["cov_units_denominator"] = k["cov_units_rate"] = np.nan
     # Spatial findings
     both = ch[ch["in_v4"] & ch["in_v8"]]
     moved = both["shift_m"][both["shift_m"] > 1]
     k["s_points_moved"] = len(moved)
     k["s_displacement_median_m"] = round(float(moved.median()), 1) if len(moved) else 0.0
+    k["s_displacement_p95_m"] = p95(moved) if len(moved) else 0.0
     k["s_displacement_max_m"] = round(float(moved.max()), 1) if len(moved) else 0.0
-    k["s_moved_into_area"] = cell(S_OUT, S_EI) + cell(S_OUT, S_NI)
-    k["s_moved_out_of_area"] = cell(S_EI, S_OUT) + cell(S_NI, S_OUT)
+    k["s_moved_into_area"] = fsum(f, OUT, [S_EI, S_NI])
+    k["s_moved_out_of_area"] = fsum(f, [S_EI, S_NI], OUT)
     gaps = sb["grantee_gap_m"].dropna()
+    k["s_grantee_gap_checked"] = len(gaps)
+    k["s_grantee_gap_over"] = int(gaps.gt(COORD_GAP_M).sum())
+    k["s_grantee_gap_rate"] = pct_of(k["s_grantee_gap_over"], len(gaps))
     k["s_grantee_gap_median_m"] = round(float(gaps.median()), 1) if len(gaps) else np.nan
+    k["s_grantee_gap_p95_m"] = p95(gaps)
     k["s_grantee_gap_max_m"] = round(float(gaps.max()), 1) if len(gaps) else np.nan
     k["s_near_boundary"] = int(sb["distance_to_boundary_m"].le(EDGE_M).sum())
     groups = {"additions": sb[sb["sub_change"].eq(SC_ADDED)], "removals": sb[sb["sub_change"].eq(SC_DROPPED)],
@@ -2183,19 +2389,79 @@ for key in PROJECTS:
     ec = ch[ch["category"].isin([CAT_ELIG_LOST, CAT_ELIG_GAINED])]
     k["conc_eligibility"], k["conc_eligibility_where"] = concentration(
         *metric_xy(ec["lon_v8"].fillna(ec["lon_v4"]), ec["lat_v8"].fillna(ec["lat_v4"])))
-    # Recommended actions, most frequent first
-    acts = pd.Series([FLAGS[fl][1] for fl in FLAGS for _ in range(k[f"flag_{fl}"])]).value_counts()
-    k["actions"] = (", ".join(acts.index) if len(acts) else
+    # Recommended actions, highest priority first
+    acts = [FLAGS[fl][1] for fl in FLAG_ORDER if k[f"flag_{fl}"]]
+    k["actions"] = (", ".join(dict.fromkeys(acts)) if acts else
                     (A_DOC if k["turn_gross"] or k["e_gross_loss"] or k["e_gross_gain"] else A_NONE))
+    # Analyst disposition (suggested; the analyst records the decision)
+    validation = (k["cur_not_found"] + k["cur_conflict"] + k["flag_conflict"] + k["flag_coordinates"]
+                  + k["cause_validation"])
+    if validation:
+        k["disposition"] = DISPOSITIONS[2]
+        why_disp = "IDs not found, conflicting source records or coordinate discrepancies need corrected data first."
+    elif k["follow_up_locations"]:
+        k["disposition"] = DISPOSITIONS[1]
+        why_disp = "Locations need follow-up with the grantee."
+    elif k["cause_indeterminate"]:
+        k["disposition"] = DISPOSITIONS[3]
+        why_disp = "Some list changes cannot be compared with the Fabric (ID in neither version)."
+    else:
+        k["disposition"] = DISPOSITIONS[0]
+        why_disp = "No follow-up, data validation issue or indeterminate change."
+    # Five determinations: source facts, analytical interpretation, suggested value, analyst decision
+    qr = qr_term(key)
+    exc = join_parts([plural(k["cur_not_found"], "ID") + f" not found in the {T_V8}" if k["cur_not_found"] else "",
+                      f"{k['cur_outside']:,} outside the award area" if k["cur_outside"] else "",
+                      f"{k['cur_not_eligible']:,} not eligible" if k["cur_not_eligible"] else "",
+                      f"{k['cur_non_bsl']:,} not broadband serviceable locations" if k["cur_non_bsl"] else "",
+                      f"{k['cur_conflict']:,} with conflicting source records" if k["cur_conflict"] else "",
+                      f"{k['cur_coordinates']:,} with a coordinate discrepancy" if k["cur_coordinates"] else ""])
+    DETERMINATIONS[key] = [
+        {"Determination": "1. Scope change",
+         "Source facts": f"{k['sub4_v4_listed']:,} locations in the {T_SUB4}, {k['sub8_v8_listed']:,} in the {qr}: "
+                         f"{k['turn_retained']:,} retained, {k['turn_removed']:,} removed, {k['turn_added']:,} added.",
+         "Analytical interpretation": (f"Gross turnover {k['turn_gross']:,} ({k['turn_rate']} % of the initial list), "
+                                       f"net change {k['turn_net']:+,}." if k["turn_gross"] else "No locations added or removed."),
+         "Suggested value": "Scope changed" if k["turn_gross"] else "No scope change"},
+        {"Determination": "2. Eligibility change",
+         "Source facts": f"Eligible locations inside the area: {k['a_v4_elig']:,} in the {T_V4}, {k['a_v8_elig']:,} in "
+                         f"the {T_V8}; gross loss {k['e_gross_loss']:,}, gross gain {k['e_gross_gain']:,}.",
+         "Analytical interpretation": (f"Net change {k['e_net']:+,}; the eligibility classification changed from eligible "
+                                       f"to not eligible for {k['e_to_not_eligible']:,} locations and from not eligible to "
+                                       f"eligible for {k['e_to_eligible']:,}."),
+         "Suggested value": "Eligible count changed" if k["e_gross_loss"] or k["e_gross_gain"] else "No eligibility change"},
+        {"Determination": "3. Observed explanation",
+         "Source facts": f"{k['turn_gross']:,} list changes compared with the observed Fabric transition of each ID.",
+         "Analytical interpretation": (join_parts([f"{k[f'cause_{n}']:,} {lower_first(c)} ({k[f'cause_{n}_rate']} %)"
+                                                   for n, c in CAUSE_NAMES.items() if k[f"cause_{n}"]]) + "."
+                                       if k["turn_gross"] else "No list changes to explain."),
+         "Suggested value": ("No list changes" if not k["turn_gross"] else
+                             "All consistent with Fabric change" if k["cause_consistent"] == k["turn_gross"] else
+                             "Partly not explained by observed Fabric change")},
+        {"Determination": "4. Current exceptions",
+         "Source facts": f"{k['cur_listed']:,} locations in the {qr} checked against the {T_V8}"
+                         + (f": {exc}." if exc else "."),
+         "Analytical interpretation": (f"{k['cur_review']:,} require review ({k['cur_multiple']:,} with more than one "
+                                       f"issue; {k['cur_usable_after_validation']:,} usable after data validation); "
+                                       f"{k['cur_acceptable']:,} acceptable."),
+         "Suggested value": "Current exceptions present" if k["cur_review"] else "No current exceptions"},
+        {"Determination": "5. Analyst disposition",
+         "Source facts": f"{k['follow_up_locations']:,} locations need follow-up; {k['flag_missing']:,} current IDs not "
+                         f"found, {k['flag_conflict']:,} with conflicting source records, {k['flag_coordinates']:,} "
+                         f"with a coordinate discrepancy, {k['cause_indeterminate']:,} indeterminate list changes.",
+         "Analytical interpretation": why_disp + " Suggested from the determinations above; it is not a decision.",
+         "Suggested value": k["disposition"]},
+    ]
+    for d in DETERMINATIONS[key]:
+        d.update({"Analyst decision": "", "Analyst notes": ""})
 
 
 def spatial_sentence(key: str) -> str:
     k, qr = KEY[key], qr_term(key)
-    out8 = k["sub8_v8_out_elig"] + k["sub8_v8_out_nelig"]
-    s = (f"Spatially, {out8:,} of the {k['sub8_v8_listed']:,} locations in the {qr} lie outside the project area and "
-         f"{plural(k['s_near_boundary'], 'listed location')} sit within {EDGE_M} m of its boundary; "
+    s = (f"Spatially, {k['cur_outside']:,} of the {k['sub8_v8_listed']:,} locations in the {qr} lie outside the project "
+         f"area and {plural(k['s_near_boundary'], 'listed location')} sit within {EDGE_M} m of its boundary; "
          f"{plural(k['s_moved_into_area'], 'Fabric point')} moved into the area and {k['s_moved_out_of_area']:,} out of it "
-         "(map edits, not buildings moving).")
+         "(map coordinate edits).")
     conc = [n for n in ("additions", "removals", "eligibility", "follow_up")
             if pd.notna(k[f"conc_{n}"]) and k[f"conc_{n}"] >= CONCENTRATED_SHARE * 100]
     if conc:
@@ -2208,44 +2474,73 @@ summary = summary.merge(pd.DataFrame.from_dict(KEY, orient="index").rename_axis(
                         on="project_key", how="left")
 summary["spatial_line"] = summary["project_key"].map(spatial_sentence)
 summary["bottom_line_full"] = (summary["bottom_line"] + " " + summary["spatial_line"]
-                               + " Recommended action: " + summary["actions"].str.lower() + ".")
+                               + " Recommended action: " + summary["actions"].str.lower() + "."
+                               + " Suggested disposition: " + summary["disposition"].str.lower() + ".")
+determinations = pd.DataFrame([{"project_key": k_, **d} for k_, ds in DETERMINATIONS.items() for d in ds])
 
 # ---- plain labels for the new measures (geodatabase name, label)
-SUB4_ = "initial grantee submission"
 FIELD_GUIDE.update({
-    "turn_retained": ("list_retained", "Locations retained (in both lists)"),
+    "turn_retained": ("list_retained", "Locations retained (in both lists; retained does not mean no action)"),
     "turn_removed": ("list_removed", "Locations removed (not carried into the 2026 data)"),
     "turn_added": ("list_added", "Locations added (new in the 2026 data)"),
     "turn_net": ("list_net_change", "Net change in listed locations (added minus removed)"),
     "turn_gross": ("list_gross_turnover", "Gross turnover (removed plus added)"),
-    "turn_rate": ("list_turnover_rate_percent", "Turnover rate, percent ((removed plus added) divided by initial locations)"),
-    "e_stable_eligible": ("eligible_stable", "Stable eligible (eligible inside the area in both versions)"),
-    "e_stable_served": ("served_stable", "Stable served (not eligible inside the area in both versions)"),
-    "e_to_served": ("eligible_to_served", "Eligible to served"),
-    "e_to_eligible": ("served_to_eligible", "Served to eligible"),
-    "e_removed": ("eligible_ids_removed", "Eligible location IDs removed from Fabric version 8"),
-    "e_new": ("new_eligible_ids", "New eligible location IDs in Fabric version 8"),
+    "turn_rate": ("list_turnover_rate_percent", "Turnover rate, percent (gross turnover divided by initial locations)"),
+    "e_stable_eligible": ("eligible_both_versions", "Eligible inside the area in both versions"),
+    "e_stable_not_eligible": ("not_eligible_both_versions", "Not eligible inside the area in both versions"),
+    "e_to_not_eligible": ("eligible_to_not_eligible", "Eligibility classification changed from eligible to not eligible"),
+    "e_to_eligible": ("not_eligible_to_eligible", "Eligibility classification changed from not eligible to eligible"),
+    "e_removed": ("eligible_ids_only_in_v4", "Eligible location IDs present only in Fabric version 4"),
+    "e_new": ("eligible_ids_only_in_v8", "Eligible location IDs present only in Fabric version 8"),
     "e_moved_out": ("eligible_points_moved_out", "Eligible points moved out of the area"),
     "e_moved_in": ("eligible_points_moved_in", "Eligible points moved into the area"),
+    "e_to_conflict": ("eligible_to_conflicting", "Eligible in version 4, conflicting source records in version 8"),
+    "e_from_conflict": ("conflicting_to_eligible", "Conflicting source records in version 4, eligible in version 8"),
+    "e_to_non_bsl": ("eligible_to_not_serviceable", "Eligible in version 4, not a serviceable location in version 8"),
+    "e_from_non_bsl": ("not_serviceable_to_eligible", "Not a serviceable location in version 4, eligible in version 8"),
     "e_gross_loss": ("eligible_gross_loss", "Gross loss of eligible locations"),
     "e_gross_gain": ("eligible_gross_gain", "Gross gain of eligible locations"),
     "e_net": ("eligible_net_change", "Net change in eligible locations (gross gain minus gross loss)"),
-    **{f"cause_{n}": (f"changes_{n}", f"List changes – {lab.lower()}") for n, lab in
-       zip(("explained", "grantee", "data_quality", "unresolved"), CLASSES)},
-    **{f"cause_{n}_rate": (f"changes_{n}_percent", f"List changes – {lab.lower()} (percent of all changes)") for n, lab in
-       zip(("explained", "grantee", "data_quality", "unresolved"), CLASSES)},
+    **{f"cause_{n}": (f"changes_{n}", f"List changes – {lower_first(c)}") for n, c in CAUSE_NAMES.items()},
+    **{f"cause_{n}_rate": (f"changes_{n}_percent", f"List changes – {lower_first(c)} (percent of gross turnover)")
+       for n, c in CAUSE_NAMES.items()},
     **{f"flag_{fl}": (f"flag_{fl}", "Flag – " + FLAGS[fl][0]) for fl in FLAGS},
     "follow_up_locations": ("follow_up_locations", "Locations that need follow-up"),
-    "data_correction_locations": ("data_correction_locations", "Locations that need a data correction"),
-    "confidence_high": ("confidence_high", "Listed locations with high confidence"),
-    "confidence_medium": ("confidence_medium", "Listed locations with medium confidence"),
-    "confidence_low": ("confidence_low", "Listed locations with low confidence"),
+    "data_validation_locations": ("data_validation_locations", "Locations with a data validation issue"),
+    "evidence_strong": ("evidence_strong", "Listed locations with strong evidence"),
+    "evidence_moderate": ("evidence_moderate", "Listed locations with moderate evidence"),
+    "evidence_limited": ("evidence_limited", "Listed locations with limited evidence"),
+    "cur_listed": ("current_listed", "Locations in the 2026 data"),
+    "cur_not_found": ("current_not_found_in_v8", "Current location IDs not found in Fabric version 8"),
+    "cur_outside": ("current_outside_area", "Current locations outside the award area"),
+    "cur_not_eligible": ("current_not_eligible", "Current locations not eligible in Fabric version 8"),
+    "cur_non_bsl": ("current_not_serviceable", "Current records that are not broadband serviceable locations"),
+    "cur_conflict": ("current_conflicting_records", "Current locations with conflicting source records (unresolved)"),
+    "cur_coordinates": ("current_coordinate_discrepancy", f"Current locations with a coordinate discrepancy over {COORD_GAP_M} m"),
+    "cur_multiple": ("current_multiple_issues", "Current locations with more than one issue"),
+    "cur_acceptable": ("current_acceptable", "Current locations acceptable (eligible inside the area, no flag)"),
+    "cur_review": ("current_review_required", "Current locations that require review"),
+    "cur_usable_after_validation": ("current_usable_after_validation",
+                                    "Current locations usable after data validation (eligible inside, only a data issue)"),
+    "cov_numerator": ("coverage_numerator", "Coverage numerator: eligible locations inside the area in the 2026 data"),
+    "cov_denominator": ("coverage_denominator", "Coverage denominator: eligible locations inside the area in Fabric version 8"),
+    "cov_rate": ("coverage_rate_percent", "Coverage rate, percent (numerator divided by denominator)"),
+    "cov_units_numerator": ("coverage_units_numerator", "Coverage by units: units at eligible listed locations inside the area"),
+    "cov_units_denominator": ("coverage_units_denominator", "Coverage by units: units at eligible locations inside the area"),
+    "cov_units_rate": ("coverage_units_rate_percent", "Coverage rate by units, percent"),
     "s_points_moved": ("points_moved_between_versions", "Fabric points that moved between versions (more than 1 m)"),
     "s_displacement_median_m": ("point_move_median_m", "Median distance a moved Fabric point moved (m)"),
+    "s_displacement_p95_m": ("point_move_95th_percentile_m", "95th percentile distance a moved Fabric point moved (m)"),
     "s_displacement_max_m": ("point_move_maximum_m", "Maximum distance a moved Fabric point moved (m)"),
     "s_moved_into_area": ("points_moved_into_area", "Fabric points moved into the area"),
     "s_moved_out_of_area": ("points_moved_out_of_area", "Fabric points moved out of the area"),
+    "s_grantee_gap_checked": ("grantee_points_checked", "Grantee coordinates checked against the Fabric point"),
+    "s_grantee_gap_over": ("grantee_point_gaps_over_threshold",
+                           f"Grantee coordinates more than {COORD_GAP_M} m from the Fabric point"),
+    "s_grantee_gap_rate": ("grantee_point_gap_rate_percent", "Coordinate discrepancy rate, percent of coordinates checked"),
     "s_grantee_gap_median_m": ("grantee_point_gap_median_m", "Median distance from grantee coordinates to the Fabric point (m)"),
+    "s_grantee_gap_p95_m": ("grantee_point_gap_95th_percentile_m",
+                            "95th percentile distance from grantee coordinates to the Fabric point (m)"),
     "s_grantee_gap_max_m": ("grantee_point_gap_maximum_m", "Maximum distance from grantee coordinates to the Fabric point (m)"),
     "s_near_boundary": ("listed_near_boundary", f"Listed locations within {EDGE_M} m of the boundary"),
     **{f"conc_{n}": (f"concentration_{n}_percent", f"Concentration of {lab}: percent in the busiest 10 % of "
@@ -2256,31 +2551,33 @@ FIELD_GUIDE.update({
        (("additions", "additions"), ("removals", "removals"), ("eligibility", "eligibility changes"),
         ("follow_up", "follow-up locations"))},
     "actions": ("recommended_action", "Recommended action"),
+    "disposition": ("suggested_disposition", "Suggested analyst disposition (the analyst records the decision)"),
     "spatial_line": ("spatial_findings", "Spatial findings"),
-    "bottom_line_full": ("bottom_line_full", "Bottom line (scope, eligibility, spatial change and action)"),
+    "bottom_line_full": ("bottom_line_full", "Bottom line (scope, eligibility, spatial change, action and disposition)"),
 })
 assert all(len(f_) <= 64 for f_, _ in FIELD_GUIDE.values())
 assert len({f_ for f_, _ in FIELD_GUIDE.values()}) == len(FIELD_GUIDE)
 field_guide = pd.DataFrame([{"source_column": c, "field_name": f_, "label": lab} for c, (f_, lab) in FIELD_GUIDE.items()])
 display(summary[["project_key", "turn_gross", "turn_rate", "e_gross_loss", "e_gross_gain", "follow_up_locations",
-                 "data_correction_locations", "actions"]])
+                 "data_validation_locations", "cur_review", "disposition"]])
 
 # %% [markdown]
 # ## 6d. All projects at a glance
 # One row per project: eligible locations and the main reasons they changed, the grantee lists with turnover, coverage, follow-up, change pattern, recommended action and a suggested next step.
 
 # %%
-FLOWS = [(S_EI, S_NI, -1, "now served"), (S_EI, S_NOT, -1, "IDs removed"), (S_EI, S_OUT, -1, "moved out of the area"),
-         (S_NI, S_EI, +1, "became eligible"), (S_NOT, S_EI, +1, "new IDs"), (S_OUT, S_EI, +1, "moved into the area")]
+FLOWS = [(S_EI, S_NI, -1, "eligible to not eligible"), (S_EI, S_NOT, -1, "IDs present only in version 4"),
+         (S_EI, OUT, -1, "points moved out of the area"), (S_EI, S_CONF, -1, "conflicting source records"),
+         (S_NI, S_EI, +1, "not eligible to eligible"), (S_NOT, S_EI, +1, "IDs present only in version 8"),
+         (OUT, S_EI, +1, "points moved into the area"), (S_CONF, S_EI, +1, "conflict in version 4 only")]
 FU_SHORT = {"B01": "outside the area or not in Fabric version 8", "B02": "not eligible in Fabric version 8",
             "B03": "eligible, not carried over", "B04": "new, already eligible in version 4"}
 
 
 def main_reasons(key: str, top: int = 3) -> str:
-    """Largest flows behind the change in eligible locations, e.g. '+20 became eligible, −14 now served'."""
+    """Largest flows behind the change in eligible locations, e.g. '−14 eligible to not eligible'."""
     f = tmat(key, "Fabric locations in the project area")
-    flows = [(sign * int(f.at[a, b]), words) for a, b, sign, words in FLOWS
-             if a in f.index and b in f.columns and int(f.at[a, b])]
+    flows = [(sign * fsum(f, a, b), words) for a, b, sign, words in FLOWS if fsum(f, a, b)]
     flows.sort(key=lambda t: -abs(t[0]))
     return ", ".join(f"{n:+,} {w}".replace("-", "−") for n, w in flows[:top]) or "No change"
 
@@ -2292,7 +2589,8 @@ def next_step(key: str) -> str:
     bad8 = k["sub8_v8_in_nelig"] + k["sub8_v8_out_elig"] + k["sub8_v8_out_nelig"]
     steps = []
     if bad8 >= MIN_LOCATIONS and bad8 >= 0.5 * n8:
-        steps.append(f"Ask why {bad8:,} of the {n8:,} planned locations are not eligible inside the area.")
+        steps.append(f"Ask the grantee to clarify why {bad8:,} of the {n8:,} planned locations are not eligible "
+                     "inside the area.")
     if P_FEWER in r["patterns"]:
         steps.append(f"Confirm the reduced scope ({k['sub4_v4_listed'] - n8:,} fewer planned locations; "
                      f"{int(plain_b.at[key, 'B03']):,} still-eligible locations dropped).")
@@ -2300,12 +2598,12 @@ def next_step(key: str) -> str:
         out8 = k["sub8_v8_out_elig"] + k["sub8_v8_out_nelig"]
         steps.append(f"Confirm the added locations ({out8:,} lie outside the area).")
     if P_SERVICE in r["patterns"]:
-        served = int(tmat(key, cap(T_SUB4)).at[S_EI, S_NI])
-        steps.append(f"Ask how the {served:,} listed locations that now have service affect the plan.")
+        served = fsum(tmat(key, cap(T_SUB4)), S_EI, S_NI)
+        steps.append(f"Ask how the {served:,} listed locations now classified as not eligible affect the plan.")
     if P_IDS in r["patterns"]:
         steps.append(f"Ask the grantee to update {k['sub4_v8_notfound']:,} IDs to Fabric version 8.")
     if P_DQ in r["patterns"] and len(steps) < 2:
-        steps.append("Request a corrected list (duplicates, invalid or missing IDs).")
+        steps.append("Request corrected data (duplicates, invalid or missing IDs, conflicting records, coordinates).")
     return " ".join(steps[:2]) or "No action needed; note the review in the project file."
 
 
@@ -2437,7 +2735,11 @@ mb = subs[subs["map_show"]].copy()
 mb["page_title"] = mb["project_key"].map(TITLE)
 mb["lon"], mb["lat"] = mb["fab_lon"], mb["fab_lat"]
 mb = mb.rename(columns={"in_sub_v4": "in_initial_submission", "in_sub_v8": "in_2026_q2_q3_data",
-                        "status_v4_plain": "status_fabric_v4", "status_v8_plain": "status_fabric_v8"})
+                        "status_v4_plain": "status_fabric_v4", "status_v8_plain": "status_fabric_v8",
+    "broadband_serviceable_v4": "serviceable_location_fabric_v4", "broadband_serviceable_v8": "serviceable_location_fabric_v8",
+    "conflicting_records_v4": "conflicting_records_fabric_v4", "conflicting_records_v8": "conflicting_records_fabric_v8",
+    "cause_class": "observed_explanation", "cause_reason": "observed_explanation_reason",
+    "questions": "questions_for_grantee"})
 cols_b = ["project_key", "page_title", "project", "location_id", "map_class", "map_label", "tier", "what_it_means", "why",
           "detail", "needs_follow_up", "in_initial_submission", "in_2026_q2_q3_data", "status_fabric_v4", "status_fabric_v8",
           "point_source", "lon", "lat"]
@@ -2491,12 +2793,14 @@ GLOSSARY = [
     (cap(T_V4), "Fabric version 4 with FFA eligibility (field FFAv4Dec23): 0 = unserved (eligible), 1 = served. The version used when projects applied."),
     (cap(T_V8), "Fabric version 8 with FFA eligibility (field status_code): 0 = unserved (eligible), 1 = served. The current version."),
     ("Location ID", "The FCC's number for one location. Between Fabric versions an ID can be removed and new IDs added."),
-    ("Eligible", "No cable or fiber service at 25/3 Mbps or better (unserved), so FFA money can serve it."),
-    ("Not eligible", "Already has cable or fiber at 25/3 Mbps or better (served)."),
+    ("Eligible", "Coded 0 (unserved) in the eligibility field: no cable or fiber at 25/3 Mbps or better reported."),
+    ("Not eligible", "Coded 1 (served) in the eligibility field. The code alone does not say why it changed."),
+    ("Conflicting source records", "The copies of a location ID in one Fabric file disagree on eligibility; the ID is "
+                                   "left out of every count, never resolved in favour of eligibility."),
     (cap(T_SUB4), "The locations the grantee listed when applying (All_448_PIDs file), using Fabric version 4 IDs."),
     (T_SUB8, "The locations in the grantee's 2026 quarterly report, Q3 or Q2 where Q3 is missing, using Fabric version 8 IDs."),
-    (TIER_FU, f"A listed location the Fabric update does not explain: in the {T_SUB8} but outside the area, missing from the {T_V8} or not eligible; not carried over although still eligible; new although already eligible in the {T_V4}."),
-    (TIER_EX, f"A change caused by the move from the {T_V4} to the {T_V8}: service reported, IDs removed, points moved, new locations."),
+    (TIER_FU, f"A listed location not explained by the observed Fabric change: in the {T_SUB8} but missing from the {T_V8}, outside the area, not eligible or not a serviceable location; not carried over although still eligible; new although already eligible in the {T_V4}; or conflicting source records."),
+    (TIER_EX, f"A change that matches an observed difference between the {T_V4} and the {T_V8}: eligibility classification changed, ID present in only one version, or point moved. Association, not cause."),
 ]
 
 # ---- tables with plain column names (shared with the per-project workbooks)
@@ -2778,14 +3082,20 @@ def results_readme(keys: list[str]) -> list[tuple[str, str]]:
             ("Coverage", "Eligible and not eligible locations inside the area: listed by the grantee or not."),
             ("From version 4 to version 8", "Where locations went: status in Fabric version 4 against status in "
              "Fabric version 8, with totals."),
-            ("Follow-up list", "One row per flag: location ID, issue, evidence, cause, recommended action, confidence "
-             "and the question to ask the grantee."),
+            ("Determinations", "Five determinations per project (scope change, eligibility change, observed "
+             "explanation, current exceptions, analyst disposition): source facts, interpretation, suggested value and "
+             "a blank analyst decision."),
+            ("Follow-up list", "One row per flag, highest priority first: location ID, issue, evidence, observed "
+             "explanation, recommended action, evidence strength and the question to ask the grantee."),
             ("Change drivers", "Counts and percentages by reason: why locations were removed or added, and why eligible "
              "locations were lost or gained."),
+            ("Review rules", "Every analyst-defined review threshold with its count, denominator and whether it was "
+             "triggered."),
             ("Spatial findings", "Boundary, point movement, coordinate gaps and where changes concentrate."),
             ("Eligibility changes", "Every Fabric location in the area whose eligibility, ID or position changed."),
-            ("Submitted locations", f"Every location in the {T_SUB4} or the {T_SUB8}, with its category, cause, "
-             "flags, recommended action, confidence and evidence."),
+            ("Submitted locations", f"Every location in the {T_SUB4} or the {T_SUB8}, with its category, observed explanation, "
+             "source facts per Fabric version, list continuity, current status, flags, priority, actions, evidence strength "
+             "and blank analyst columns."),
             ("Category counts", "How many locations fall in each map category."),
             ("Data cleaning", "Rows read, rows skipped, duplicates removed and locations counted, per list."),
             ("Duplicate location IDs", "Every location ID that appeared more than once, and how often."),
@@ -2797,7 +3107,7 @@ def column_guide(sheets: dict[str, pd.DataFrame]) -> pd.DataFrame:
     """Every column header with its meaning (key-number measures are explained by their own wording)."""
     meaning = {"Project": "Project name.", "Location ID": "The FCC's number for one location.",
                "Category": "What happened to the location; the cell colour matches the maps.",
-               "Tier": "Needs follow-up, Explained by the Fabric update, or No change.",
+               "Tier": "Needs follow-up, Consistent with Fabric change, or No change.",
                "Section": "Group of related measures.", "Measure": "What is counted, written out in full.",
                "Locations": "Number of locations, or which group of locations the rows describe.",
                "Total": "Row or column total.", "Map": "The map page the category belongs to.",
@@ -2847,40 +3157,50 @@ def results_workbook(path: Path, keys: list[str]) -> None:
     write_workbook(path, results_readme(keys), result_sheets(keys))
 
 KEY_SECTIONS[1:1] = [
-    ("Eligibility change in detail", ["e_stable_eligible", "e_stable_served", "e_to_served", "e_to_eligible",
-                                      "e_removed", "e_new", "e_moved_out", "e_moved_in", "e_gross_loss",
+    ("Eligibility change in detail", ["e_stable_eligible", "e_stable_not_eligible", "e_to_not_eligible", "e_to_eligible",
+                                      "e_removed", "e_new", "e_moved_out", "e_moved_in", "e_to_conflict",
+                                      "e_from_conflict", "e_to_non_bsl", "e_from_non_bsl", "e_gross_loss",
                                       "e_gross_gain", "e_net"])]
 KEY_SECTIONS.extend([
     ("Scope change", ["turn_retained", "turn_removed", "turn_added", "turn_net", "turn_gross", "turn_rate"]),
-    ("Cause of the list changes", [f"cause_{n}{r}" for n in ("explained", "grantee", "data_quality", "unresolved")
-                                   for r in ("", "_rate")]),
-    ("Flags and action", [f"flag_{fl}" for fl in FLAGS] + ["follow_up_locations", "data_correction_locations", "actions"]),
-    ("Confidence", ["confidence_high", "confidence_medium", "confidence_low"]),
-    ("Spatial findings", ["s_points_moved", "s_displacement_median_m", "s_displacement_max_m", "s_moved_into_area",
-                          "s_moved_out_of_area", "s_near_boundary", "s_grantee_gap_median_m", "s_grantee_gap_max_m"]
+    ("Observed explanation of the list changes", [f"cause_{n}{r}" for n in CAUSE_NAMES for r in ("", "_rate")]),
+    ("Current exceptions (2026 data against Fabric version 8)",
+     ["cur_listed", "cur_not_found", "cur_outside", "cur_not_eligible", "cur_non_bsl", "cur_conflict",
+      "cur_coordinates", "cur_multiple", "cur_review", "cur_usable_after_validation", "cur_acceptable"]),
+    ("Coverage rate", ["cov_numerator", "cov_denominator", "cov_rate", "cov_units_numerator",
+                       "cov_units_denominator", "cov_units_rate"]),
+    ("Flags and action", [f"flag_{fl}" for fl in FLAG_ORDER] + ["follow_up_locations", "data_validation_locations",
+                                                                "actions"]),
+    ("Evidence strength", ["evidence_strong", "evidence_moderate", "evidence_limited"]),
+    ("Spatial findings", ["s_points_moved", "s_displacement_median_m", "s_displacement_p95_m", "s_displacement_max_m",
+                          "s_moved_into_area", "s_moved_out_of_area", "s_near_boundary", "s_grantee_gap_checked",
+                          "s_grantee_gap_over", "s_grantee_gap_rate", "s_grantee_gap_median_m",
+                          "s_grantee_gap_p95_m", "s_grantee_gap_max_m"]
      + [f"conc_{n}{w}" for n in ("additions", "removals", "eligibility", "follow_up") for w in ("", "_where")]),
+    ("Analyst disposition", ["disposition"]),
     ("Bottom line", ["bottom_line_full"]),
 ])
 
 
 def change_drivers(keys: list[str]) -> pd.DataFrame:
-    """Counts and percentages by reason: list changes by cause, eligibility changes by flow."""
+    """Counts and percentages by reason: list changes by observed explanation, eligibility changes by flow."""
     rows = []
     for key in keys:
         k = KEY[key]
         sb = subs[(subs["project_key"] == key) & (subs["cause_class"] != C_RETAINED)]
         for (cls, why, chg_), n in sb.groupby(["cause_class", "cause_reason", "sub_change"]).size().items():
             rows.append({"Project": LABEL[key], "What changed": "Grantee list: " + (
-                "removed" if chg_ == SC_DROPPED else "added"), "Cause": cls, "Reason": why, "Locations": int(n),
-                "Percent of this kind of change": pct_of(n, k["turn_gross"])})
-        for name, lab, kind in (("e_to_served", "Eligible to served", "loss"), ("e_removed", "Eligible ID removed", "loss"),
-                                ("e_moved_out", "Eligible point moved out of the area", "loss"),
-                                ("e_to_eligible", "Served to eligible", "gain"), ("e_new", "New eligible ID", "gain"),
-                                ("e_moved_in", "Eligible point moved into the area", "gain")):
+                "removed" if chg_ == SC_DROPPED else "added"), "Observed explanation": cls, "Reason": why,
+                "Locations": int(n), "Percent of gross turnover or of the gross eligible change": pct_of(n, k["turn_gross"])})
+        for name, kind in (("e_to_not_eligible", "loss"), ("e_removed", "loss"), ("e_moved_out", "loss"),
+                           ("e_to_conflict", "loss"), ("e_to_non_bsl", "loss"), ("e_to_eligible", "gain"),
+                           ("e_new", "gain"), ("e_moved_in", "gain"), ("e_from_conflict", "gain"),
+                           ("e_from_non_bsl", "gain")):
             if k[name]:
-                rows.append({"Project": LABEL[key], "What changed": f"Eligible locations in the area: {kind}",
-                             "Cause": C_EXPLAINED, "Reason": lab, "Locations": k[name],
-                             "Percent of this kind of change": pct_of(k[name], k[f"e_gross_{kind}"])})
+                rows.append({"Project": LABEL[key], "What changed": f"Eligible locations in the area: gross {kind}",
+                             "Observed explanation": "Observed Fabric transition", "Reason": FIELD_GUIDE[name][1],
+                             "Locations": k[name],
+                             "Percent of gross turnover or of the gross eligible change": pct_of(k[name], k[f"e_gross_{kind}"])})
     return pd.DataFrame(rows)
 
 
@@ -2893,65 +3213,130 @@ def spatial_findings(keys: list[str]) -> pd.DataFrame:
 
 
 def follow_up_table(keys: list[str]) -> pd.DataFrame:
-    """One row per flag: location ID, issue, evidence, recommended action, confidence and the question to ask."""
+    """One row per flag: location ID, priority, issue, evidence, action, evidence strength and the question to ask."""
     sb = subs[subs["project_key"].isin(keys)]
     rows = []
     for _, r in sb.iterrows():
-        for fl in FLAGS:
+        for fl in FLAG_ORDER:
             if r[f"flag_{fl}"]:
                 rows.append({"Project": r["project"], "Location ID": int(r["location_id"]),
-                             "Issue": FLAGS[fl][0], "Kind": "Needs follow-up" if fl in FOLLOW_UP_FLAGS else "Data correction",
-                             "Evidence": r["evidence"], "Cause of the list change": r["cause_class"],
-                             "Reason": r["cause_reason"], "Recommended action": FLAGS[fl][1],
-                             "Confidence": r["confidence"], "What to ask the grantee": FLAGS[fl][2]})
-    cols = ["Project", "Location ID", "Issue", "Kind", "Evidence", "Cause of the list change", "Reason",
-            "Recommended action", "Confidence", "What to ask the grantee"]
-    return pd.DataFrame(rows, columns=cols).sort_values(["Project", "Kind", "Issue", "Location ID"], ignore_index=True)
+                             "Priority": FLAGS[fl][3], "Issue": FLAGS[fl][0], "Kind": FLAGS[fl][4],
+                             "Evidence": r["evidence"], "List continuity": r["list_continuity"],
+                             "Observed explanation": r["cause_class"], "Reason": r["cause_reason"],
+                             "Recommended action": FLAGS[fl][1], "Evidence strength": r["evidence_strength"],
+                             "What to ask the grantee": FLAGS[fl][2]})
+    cols = ["Project", "Location ID", "Priority", "Issue", "Kind", "Evidence", "List continuity",
+            "Observed explanation", "Reason", "Recommended action", "Evidence strength", "What to ask the grantee"]
+    return pd.DataFrame(rows, columns=cols).sort_values(["Project", "Priority", "Issue", "Location ID"], ignore_index=True)
+
+
+LOCATION_FACTS = {   # source facts first, then interpretations, then the analyst's columns
+    "project": "Project", "location_id": "Location ID",
+    "in_sub_v4": "In the initial grantee submission", "in_sub_v8": "In the 2026 Q2 and Q3 data",
+    "present_in_fabric_v4": "Present in Fabric version 4", "inside_award_area_v4": "Inside the award area in Fabric version 4",
+    "eligible_v4": "Eligible in Fabric version 4", "broadband_serviceable_v4": "Broadband serviceable location in Fabric version 4",
+    "conflicting_records_v4": "Conflicting source records in Fabric version 4",
+    "present_in_fabric_v8": "Present in Fabric version 8", "inside_award_area_v8": "Inside the award area in Fabric version 8",
+    "eligible_v8": "Eligible in Fabric version 8", "broadband_serviceable_v8": "Broadband serviceable location in Fabric version 8",
+    "conflicting_records_v8": "Conflicting source records in Fabric version 8",
+    "distance_to_boundary_m": "Distance to the boundary (m)", "grantee_gap_m": "Grantee point to Fabric point (m)",
+    "list_continuity": "List continuity", "fabric_transition": "Observed Fabric transition",
+    "current_status": "Current status", "map_label": "Category", "cause_class": "Observed explanation",
+    "cause_reason": "Reason", "all_flags": "All flags", "flag_count": "Number of flags", "priority": "Priority",
+    "priority_reason": "Priority reason", "primary_action": "Primary action",
+    "all_recommended_actions": "All recommended actions", "evidence_strength": "Evidence strength",
+    "basis_exact_id_both_versions": "Basis: exact ID in both versions",
+    "basis_exact_id_one_version": "Basis: exact ID in one version only",
+    "basis_boundary_sensitive": "Basis: boundary-sensitive", "basis_coordinate_discrepancy": "Basis: coordinate discrepancy",
+    "basis_conflicting_records": "Basis: conflicting source records", "evidence": "Evidence",
+}
+FACT_YES_NO = [c for c in LOCATION_FACTS if c.startswith(("in_sub_", "present_", "inside_", "eligible_", "broadband_",
+                                                           "conflicting_", "basis_"))]
 
 
 def listed_locations(keys: list[str]) -> pd.DataFrame:
-    sb = subs[subs["project_key"].isin(keys)].sort_values(["project", "map_class", "location_id"])
-    out = sb[["project", "location_id", "map_class", "map_label", "cause_class", "cause_reason", "flags",
-              "recommended_action", "confidence", "evidence", "in_sub_v4", "in_sub_v8", "status_v4_plain",
-              "status_v8_plain", "distance_to_boundary_m", "grantee_gap_m"]].copy()
-    out["in_sub_v4"], out["in_sub_v8"] = yes_no(out["in_sub_v4"]), yes_no(out["in_sub_v8"])
-    return out.rename(columns={**COLUMN_HEADS, "cause_class": "Cause of the list change", "cause_reason": "Reason",
-                               "flags": "Flags", "recommended_action": "Recommended action", "confidence": "Confidence",
-                               "evidence": "Evidence", "distance_to_boundary_m": "Distance to the boundary (m)",
-                               "grantee_gap_m": "Grantee point to Fabric point (m)"})
+    sb = subs[subs["project_key"].isin(keys)].sort_values(["project", "priority", "map_class", "location_id"])
+    out = sb[["map_class", *LOCATION_FACTS]].copy()
+    for c in FACT_YES_NO:
+        out[c] = out[c].fillna(False).astype(bool).map({True: "Yes", False: "No"})
+    out["priority"] = out["priority"].astype("Int64")
+    out["Analyst decision"], out["Analyst notes"] = "", ""
+    return out.rename(columns=LOCATION_FACTS)
+
+
+def determinations_table(keys: list[str]) -> pd.DataFrame:
+    d = determinations[determinations["project_key"].isin(keys)].copy()
+    d.insert(0, "Project", d.pop("project_key").map(LABEL))
+    return d
+
+
+def review_rules_table(keys: list[str]) -> pd.DataFrame:
+    r = review_rules[review_rules["project_key"].isin(keys)].copy()
+    r.insert(0, "Project", r.pop("project_key").map(LABEL))
+    return r
 
 
 _base_location_sheets = location_sheets
 
 
 def location_sheets(keys: list[str]) -> dict[str, pd.DataFrame]:
-    """Follow-up list (one row per flag) and listed locations with cause, action and confidence."""
+    """Determinations, follow-up list (one row per flag), drivers, review rules and every listed location."""
     base = _base_location_sheets(keys)
-    return {"Follow-up list": follow_up_table(keys), "Change drivers": change_drivers(keys),
+    return {"Determinations": determinations_table(keys), "Follow-up list": follow_up_table(keys),
+            "Change drivers": change_drivers(keys), "Review rules": review_rules_table(keys),
             "Spatial findings": spatial_findings(keys), "Eligibility changes": base["Eligibility changes"],
             "Submitted locations": listed_locations(keys), "Category counts": base["Category counts"]}
 
 
-WRAP_COLS.update({"Issue", "Evidence", "Reason", "Recommended action", "Cause", "Finding", "Value", "Flags"})
+WRAP_COLS.update({"Issue", "Evidence", "Reason", "Recommended action", "Observed explanation", "Finding", "Value",
+                  "All flags", "All recommended actions", "Source facts", "Analytical interpretation", "Priority reason",
+                  "Review rule", "Analyst notes"})
+WRAP_SHEETS.add("Determinations")
 COLUMN_MEANINGS.update({
-    "Issue": "What the flag is about.", "Kind": "Needs follow-up (also on the follow-up map) or Data correction.",
-    "Evidence": "The facts behind the flag: status in both Fabric versions, which lists hold the location, "
+    "Issue": "What the flag is about.",
+    "Kind": "Needs follow-up (also on the follow-up map) or Data validation.",
+    "Priority": "1 = look at first: 1 ID not found in Fabric version 8, 2 outside the award area, 3 not eligible, "
+                "4 not a broadband serviceable location, 5 removed but still eligible, 6 added without an observed "
+                "Fabric transition, 7 conflicting source records or coordinate discrepancy.",
+    "Priority reason": "The highest-priority flag on the location.",
+    "Evidence": "The source facts behind the flags: status in both Fabric versions, which lists hold the location, "
                 "boundary distance and coordinate gap where relevant.",
-    "Cause of the list change": "Explained by the Fabric update, Grantee-driven or not explained by the Fabric, "
-                                "Data-quality issue, Unresolved, or Retained.",
-    "Reason": "The specific reason behind the cause.",
-    "Recommended action": "No action, Document change, Verify eligibility, Verify boundary, Confirm scope change, "
-                          "or Correct data.",
-    "Confidence": "High: ID in both Fabric versions and away from the boundary. Medium: ID in only one version. "
-                  "Low: ID in neither version, within the boundary distance, or a large coordinate gap.",
+    "Observed explanation": "Analytical interpretation of an added or removed location: Consistent with Fabric change, "
+                            "Not explained by observed Fabric change, Data validation issue, or Indeterminate. "
+                            "Consistent means the observed Fabric transition fits the list change; it does not prove "
+                            "the cause.",
+    "Reason": "The observed transition behind the explanation.",
+    "Recommended action": "Verify eligibility, Verify boundary, Confirm scope change, Correct data, Document change, "
+                          "or No action.",
+    "Primary action": "The action for the highest-priority flag (Document change or No action when there is no flag).",
+    "All recommended actions": "Every action that applies to the location.",
+    "All flags": "Every flag on the location, highest priority first.", "Number of flags": "How many flags apply.",
+    "Evidence strength": "Strength of the evidence (not certainty of a conclusion). Strong: exact ID in both Fabric "
+                         "versions, no limiting factor. Moderate: exact ID in one version only. Limited: ID in neither "
+                         "version, boundary-sensitive, coordinate discrepancy, or conflicting source records.",
+    "List continuity": "Retained (in both lists), Removed, or Added. Retained does not mean no action.",
+    "Observed Fabric transition": "What changed for the ID between Fabric version 4 and version 8.",
+    "Current status": "Acceptable (in the 2026 data, eligible inside the area, no flag), Review required, or "
+                      "Not on the current list.",
     "What changed": "Which count changed: the grantee list or the eligible locations in the area.",
-    "Cause": "Explained by the Fabric update, Grantee-driven or not explained by the Fabric, Data-quality issue, "
-             "or Unresolved.",
-    "Percent of this kind of change": "Share of all list changes (removed plus added), or of the gross loss or gross "
-                                      "gain of eligible locations.",
+    "Percent of gross turnover or of the gross eligible change": "Share of the gross turnover (removed plus added), "
+                                                                  "or of the gross loss or gross gain of eligible locations.",
     "Finding": "Spatial measure, written out.", "Value": "Value of the finding.",
-    "Flags": "Every flag on the location.", "Distance to the boundary (m)": "Distance from the Fabric point to the "
-    "project boundary.", "Grantee point to Fabric point (m)": "Distance from the grantee's coordinates to the Fabric point.",
+    "Distance to the boundary (m)": "Distance from the Fabric point to the project boundary.",
+    "Grantee point to Fabric point (m)": "Distance from the grantee's coordinates to the Fabric point.",
+    "Determination": "One of five determinations: scope change, eligibility change, observed explanation, current "
+                     "exceptions, analyst disposition.",
+    "Source facts": "Counts taken directly from the grantee lists and the Fabric.",
+    "Analytical interpretation": "What the analysis reads from the facts.",
+    "Suggested value": "The analysis's suggestion. For the disposition: Accept and document, Request clarification, "
+                       "Request corrected data, or Further review.",
+    "Analyst decision": "Left blank for the analyst's decision.", "Analyst notes": "Left blank for the analyst.",
+    "Pattern": "The change pattern the review rule belongs to.", "Review rule": "What the rule counts.",
+    "Count": "Locations or rows counted.", "Denominator": "What the count is divided by.",
+    "Share (percent)": "Count divided by the denominator.",
+    "Threshold": "Analyst-defined review threshold (configurable in the notebook settings).",
+    "Triggered": "Yes if the count reached the threshold.",
+    **{v: f"Yes or No: {v[0].lower() + v[1:]}." for c, v in LOCATION_FACTS.items() if c in FACT_YES_NO},
     "Rows with no location ID (skipped)": "Rows where the location ID cell was empty.",
     "Rows with an invalid location ID (skipped)": "Rows where the location ID was not a whole number.",
     "Rows skipped in total": "Rows with no or an invalid location ID.",
@@ -2982,7 +3367,8 @@ COLUMN_MEANINGS.update({
     "Duplicate rows removed": "Extra rows removed so each location counts once.",
     "Locations counted": "Unique locations used in the analysis.", "Note": "How the source was cleaned.",
     "Times listed": "How many rows carried this ID.",
-    "Eligible in one copy, not eligible in another": "The copies disagreed on eligibility; the eligible copy was kept.",
+    "Eligible in one copy, not eligible in another": "Yes when the copies disagree on eligibility; the ID is then marked "
+                                                     "as conflicting source records and left out of the eligibility counts.",
     "What the category means": "Plain explanation of the category.", "Detail": "Extra detail, such as how far a point moved.",
     "Eligible in Fabric version 4": "Yes if eligible (unserved) in Fabric version 4.",
     "Eligible in Fabric version 8": "Yes if eligible (unserved) in Fabric version 8.",
@@ -3019,27 +3405,41 @@ def project_markdown(key: str, full_follow_up: bool) -> str:
         ("Net change / gross turnover / turnover rate", f"{g('turn_net')} / {g('turn_gross')} / {g('turn_rate')} %"),
         ("Eligible locations in the area: version 4 → version 8", f"{g('a_v4_elig')} → {g('a_v8_elig')}"),
         ("Eligibility gross loss / gross gain / net", f"{g('e_gross_loss')} / {g('e_gross_gain')} / {g('e_net')}"),
-        ("List changes explained / grantee-driven / data quality / unresolved",
-         f"{g('cause_explained')} ({g('cause_explained_rate')} %) / {g('cause_grantee')} ({g('cause_grantee_rate')} %) / "
-         f"{g('cause_data_quality')} ({g('cause_data_quality_rate')} %) / {g('cause_unresolved')} ({g('cause_unresolved_rate')} %)"),
-        ("Needs follow-up / data corrections", f"{g('follow_up_locations')} / {g('data_correction_locations')}"),
-        ("Confidence high / medium / low", f"{g('confidence_high')} / {g('confidence_medium')} / {g('confidence_low')}"),
+        *[(f"List changes: {lower_first(c)}", f"{g(f'cause_{n}')} ({g(f'cause_{n}_rate')} % of gross turnover)")
+          for n, c in CAUSE_NAMES.items()],
+        ("Current: not found in version 8 / outside / not eligible / not serviceable / conflicting",
+         f"{g('cur_not_found')} / {g('cur_outside')} / {g('cur_not_eligible')} / {g('cur_non_bsl')} / {g('cur_conflict')}"),
+        ("Current: review required / multiple issues / usable after validation / acceptable",
+         f"{g('cur_review')} / {g('cur_multiple')} / {g('cur_usable_after_validation')} / {g('cur_acceptable')}"),
+        ("Coverage rate (numerator / denominator)", f"{g('cov_rate')} % ({g('cov_numerator')} / {g('cov_denominator')})"),
+        ("Coverage rate by units (numerator / denominator)",
+         f"{g('cov_units_rate')} % ({g('cov_units_numerator')} / {g('cov_units_denominator')})"),
+        ("Needs follow-up / data validation", f"{g('follow_up_locations')} / {g('data_validation_locations')}"),
+        ("Evidence strength strong / moderate / limited",
+         f"{g('evidence_strong')} / {g('evidence_moderate')} / {g('evidence_limited')}"),
     ], columns=["Measure", "Value"])
     fu = follow_up_table([key])
+    rules = review_rules_table([key]).drop(columns=["Project", "Kind"])
     out = [f"## {r['label']} ({r['pr_number']})\n",
            f"**Bottom line.** {r['bottom_line_full']}\n",
-           f"**Change pattern:** {r['patterns']}  \n**Recommended action:** {r['actions']}\n",
+           f"**Change pattern:** {r['patterns']}  \n**Recommended action:** {r['actions']}  \n"
+           f"**Suggested disposition:** {r['disposition']} (analyst decision recorded separately)\n",
+           "### Determinations\n", md_table(determinations_table([key]).drop(columns=["Project", "Analyst decision",
+                                                                                        "Analyst notes"])),
            "### Key metrics\n", md_table(metrics),
            "### Change drivers\n", md_table(change_drivers([key]).drop(columns="Project")),
+           "### Review rules (analyst-defined review thresholds)\n", md_table(rules),
            "### Spatial findings\n", r["spatial_line"] + "\n",
            md_table(spatial_findings([key]).drop(columns="Project").iloc[:-1]),
            "### How the change came together\n", r["story_why"] + "\n",
            f"### Follow-up ({len(fu):,} flags)\n"]
     if full_follow_up:
-        out.append(md_table(fu.drop(columns="Project")[["Location ID", "Issue", "Evidence", "Recommended action",
-                                                         "Confidence", "What to ask the grantee"]]))
+        out.append(md_table(fu.drop(columns="Project")[["Location ID", "Priority", "Issue", "Evidence",
+                                                         "Recommended action", "Evidence strength",
+                                                         "What to ask the grantee"]]))
     else:
-        out.append(md_table(fu.groupby(["Issue", "Recommended action"]).size().rename("Locations").reset_index()))
+        out.append(md_table(fu.groupby(["Priority", "Issue", "Recommended action"]).size().rename("Locations")
+                            .reset_index()))
         out.append(f"Location-level list: `projects/{key}_{r['pr_number']}/{key}_{r['pr_number']}_results.md`.\n")
     return "\n".join(out)
 
@@ -3050,7 +3450,9 @@ def write_markdown(path: Path, keys: list[str]) -> None:
             f"Run on {RUN_DATE}. {cap(T_V4)} (field {V4_FIELD_NAME}) and {T_V8} (field {V8_FIELD_NAME}), "
             f"0 = unserved (eligible), 1 = served. The {T_SUB8} is the grantee's planned list. Locations are matched "
             "by location ID and placed at the Fabric point of that ID; closeness is never used to treat two IDs as one "
-            "building. Moved coordinates are FCC map edits, not buildings that moved.\n"]
+            "building. Moved coordinates are map coordinate edits. Source facts, analytical interpretations and the "
+            "analyst's decisions are kept apart: the explanations say whether a change is consistent with the observed "
+            "Fabric change, not what caused it.\n"]
     if not one:
         head += ["## At a glance\n", md_table(glance)]
     body = [project_markdown(k, full_follow_up=one) for k in keys]
@@ -3143,7 +3545,7 @@ report = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta na
 <p><b>Grantee submission changes</b> – every location in the {T_SUB4} or the {T_SUB8}. Follow-up checks are applied first.</p>
 <table><tr><th>Category</th><th>Tier</th><th>What it means</th></tr>{legend_rows(SUB_CLASSES)}</table>
 <h2>Data cleaning</h2>
-<p>Before counting, each list was cleaned: rows without a valid location ID were skipped and every location counted once. When an eligibility file listed the same ID twice with different eligibility, the eligible record was kept.</p>
+<p>Before counting, each list was cleaned: rows without a valid location ID were skipped and every location counted once. When an eligibility file listed the same ID twice with different eligibility, the ID was marked as conflicting source records and left out of the counts.</p>
 <table><tr><th>Project</th><th>List</th><th>Rows read</th><th>Rows skipped (no valid ID)</th><th>IDs listed more than once</th><th>Duplicate rows removed</th><th>Locations counted</th></tr>{clean_rows}</table>
 <h2>Key terms</h2><table>{gloss}</table>
 <h2>Cautions</h2><ul>
@@ -3194,7 +3596,9 @@ for v in ("v4", "v8"):
     a = attrs[v]
     ids = loc["location_id"]
     loc[f"in_fcc_map_{v}"] = ids.isin(a.index)
-    loc[f"eligible_{v}"] = ids.map(a["eligible"].astype(bool)).fillna(False)
+    loc[f"conflicting_records_{v}"] = ids.map(a["conflict"].astype(bool)).fillna(False)
+    loc[f"eligible_{v}"] = ids.map(a["eligible"].astype(bool)).fillna(False) & ~loc[f"conflicting_records_{v}"]
+    loc[f"broadband_serviceable_{v}"] = ids.map(a["bsl"].astype(bool)).fillna(False)
     loc[f"inside_area_{v}"] = [lid in area_sets[v].get(k, set()) for k, lid in zip(loc["project_key"], ids)]
 
 loc["in_application_list"] = loc["in_sub_v4"].fillna(False)
@@ -3230,17 +3634,28 @@ loc["headline"] = np.where(loc["needs_follow_up"], "Needs follow-up: " + loc["fo
 loc["project"] = loc["project_key"].map(LABEL)
 loc["page_title"] = loc["project_key"].map(summary.set_index("project_key")["page_title"])
 loc["detail"] = (loc["fcc_map_detail"].fillna("") + "; " + loc["list_detail"].fillna("")).str.strip("; ")
+REVIEW_COLS = ["list_continuity", "current_status", "fabric_transition", "cause_class", "cause_reason", "all_flags",
+               "priority", "priority_reason", "primary_action", "all_recommended_actions", "evidence_strength",
+               "questions"]
+loc = loc.merge(subs[["project_key", "location_id", *REVIEW_COLS]], on=["project_key", "location_id"], how="left")
+loc["list_continuity"] = loc["list_continuity"].fillna("Not in either list")
+loc["current_status"] = loc["current_status"].fillna("Not on the current list")
+for c in REVIEW_COLS:
+    if c != "priority":
+        loc[c] = loc[c].fillna("")
 loc["lon"] = loc["lon_v8"].fillna(loc["lon_v4"]).fillna(loc["fab_lon"])
 loc["lat"] = loc["lat_v8"].fillna(loc["lat_v4"]).fillna(loc["fab_lat"])
 
 FLAG_COLS = ["needs_follow_up", "on_grantee_list", "in_application_list", "in_2026_report", "in_fcc_map_v4",
-             "in_fcc_map_v8", "inside_area_v4", "inside_area_v8", "eligible_v4", "eligible_v8", "listed_more_than_once"]
+             "in_fcc_map_v8", "inside_area_v4", "inside_area_v8", "eligible_v4", "eligible_v8", "listed_more_than_once",
+             "conflicting_records_v4", "conflicting_records_v8", "broadband_serviceable_v4", "broadband_serviceable_v8"]
 analyst_locations = loc[["project_key", "project", "page_title", "location_id", "headline", "needs_follow_up",
                          "follow_up_reason", "fcc_map_change", "fcc_map_change_tier", "list_change", "list_change_tier",
                          "list_change_why", "on_grantee_list", "in_application_list", "in_2026_report",
                          "in_fcc_map_v4", "in_fcc_map_v8", "inside_area_v4", "inside_area_v8", "eligible_v4",
-                         "eligible_v8", "status_v4_plain", "status_v8_plain", "shift_m",
-                         "detail", "listed_more_than_once", "duplicate_note", "lon", "lat"]].copy()
+                         "eligible_v8", "broadband_serviceable_v4", "broadband_serviceable_v8",
+                         "conflicting_records_v4", "conflicting_records_v8", "status_v4_plain", "status_v8_plain",
+                         *REVIEW_COLS, "shift_m", "detail", "listed_more_than_once", "duplicate_note", "lon", "lat"]].copy()
 for c in FLAG_COLS:
     analyst_locations[c] = yes_no_col(analyst_locations[c])
 ANALYST_FIELD_NAMES = {
@@ -3250,7 +3665,11 @@ ANALYST_FIELD_NAMES = {
     "in_2026_report": "in_2026_q2_q3_data", "in_fcc_map_v4": "in_fabric_v4_data", "in_fcc_map_v8": "in_fabric_v8_data",
     "inside_area_v4": "inside_area_fabric_v4", "inside_area_v8": "inside_area_fabric_v8",
     "eligible_v4": "eligible_fabric_v4", "eligible_v8": "eligible_fabric_v8",
-    "status_v4_plain": "status_fabric_v4", "status_v8_plain": "status_fabric_v8"}
+    "status_v4_plain": "status_fabric_v4", "status_v8_plain": "status_fabric_v8",
+    "broadband_serviceable_v4": "serviceable_location_fabric_v4", "broadband_serviceable_v8": "serviceable_location_fabric_v8",
+    "conflicting_records_v4": "conflicting_records_fabric_v4", "conflicting_records_v8": "conflicting_records_fabric_v8",
+    "cause_class": "observed_explanation", "cause_reason": "observed_explanation_reason",
+    "questions": "questions_for_grantee"}
 analyst_locations = (points_from_lonlat(analyst_locations.rename(columns=ANALYST_FIELD_NAMES))
                      .sort_values(["project_key", "needs_follow_up", "location_id"], ascending=[True, False, True])
                      .reset_index(drop=True))
@@ -3260,6 +3679,8 @@ PROJECT_COLS = ["project_key", "label", "pr_number", "page_title", "bottom_line"
                 "s_dropped", "s_added", "fu_total", *[f"fu_{c.lower()}" for c in FOLLOW_UP_CLASSES], "far_points",
                 "sub4_dup_rows", "sub8_dup_rows", "patterns", "pattern_notes", "story_why", "story_a", "story_b",
                 "story_c", "sub_v8_file", *key_numbers.columns]
+PROJECT_COLS += [c for c in dict.fromkeys([*KEY[next(iter(KEY))], "spatial_line", "bottom_line_full"])
+                 if c in summary.columns and c not in PROJECT_COLS]
 analyst_projects = field_names(areas[["project_key", "geometry"]].merge(summary[PROJECT_COLS], on="project_key"))
 ANALYST_LAYERS = {"projects": analyst_projects, "locations": analyst_locations, "category_legend": legend,
                   "field_guide": field_guide}
@@ -3626,7 +4047,7 @@ def map_page(pdf, r: pd.Series, page: str, pts: gpd.GeoDataFrame, kind: str, pag
                     FABRIC_CLASSES, r["story_a"]),
               "B": ("Grantee submission changes", f"{cap(T_SUB4)} compared with the {qr}",
                     SUB_CLASSES, r["story_b"]),
-              "C": ("Locations that need follow-up", "Listed locations the Fabric update does not explain",
+              "C": ("Locations that need follow-up", "Listed locations not explained by the observed Fabric change",
                     FOLLOW_CLASSES, r["story_c"])}
     heading, sub, classes, story = titles[page]
     fig = plt.figure(figsize=(PAGE_W, PAGE_H))
@@ -3729,8 +4150,8 @@ def summary_page(pdf, r: pd.Series, n_pages: int) -> None:
     fit_text(fig, "Recommended action: " + r["actions"], 0.55, top - 1.38, left_w - 0.35, 0.22, size=9, min_size=8,
              fontweight="bold")
     # Key numbers
-    rh, ts = 0.22, 9.0
-    y = top - box_h - 0.18
+    rh, ts = 0.205, 9.0
+    y = top - box_h - 0.14
     panel_heading(fig, "Key numbers", 0.35, y)
     widths = [2.6, 1.35, 1.35, 1.0]
     rows = [["Locations in the project area", f"{r['v4_total']:,}", f"{r['v8_total']:,}", f"{int(r['total_chg']):+,}"],
@@ -3744,17 +4165,19 @@ def summary_page(pdf, r: pd.Series, n_pages: int) -> None:
     rows = [[lab, f"{int(r[f'sub4_v4_{m}']):,}", f"{int(r[f'sub8_v8_{m}']):,}",
              f"{int(r[f'sub8_v8_{m}'] - r[f'sub4_v4_{m}']):+,}" if r[f'sub8_v8_{m}'] != r[f'sub4_v4_{m}'] else "0"]
             for lab, m in sub_rows]
-    y = draw_table(fig, 0.35, y - 0.12, widths, ["Grantee submissions", "Initial grantee\nsubmission · v4",
+    y = draw_table(fig, 0.35, y - 0.1, widths, ["Grantee submissions", "Initial grantee\nsubmission · v4",
                                                   qr.replace(" data", " data\n") + "· v8", "Change"], rows,
                    size=ts, row_h=rh, header_h=0.4)
     # Follow-up counts
-    y -= 0.18
+    y -= 0.14
     panel_heading(fig, "Needs follow-up", 0.35, y)
     n = plain_b.loc[key]
-    fu_rows = [[SUB_CLASSES[c][0].replace(T_SUB8_SHORT, qr), f"{int(n[c]):,}"] for c in FOLLOW_UP_CLASSES]
+    shown = [c for c in FOLLOW_UP_CLASSES if n[c]]          # categories with no location are left out
+    fu_rows = [[SUB_CLASSES[c][0].replace(T_SUB8_SHORT, qr), f"{int(n[c]):,}"] for c in shown] or [["None", "0"]]
     fu_rows.append(["Total", f"{int(r['fu_total']):,}"])
-    y = draw_table(fig, 0.35, y - 0.27, [5.3, 1.0], ["Reason", "Locations"], fu_rows, size=ts, row_h=rh,
-                   swatches=[SUB_CLASSES[c][2] for c in FOLLOW_UP_CLASSES] + [None])
+    fu_rh = min(rh, (y - 0.27 - 0.72) / (len(fu_rows) + 1))   # rows shrink to stay above the footer
+    y = draw_table(fig, 0.35, y - 0.27, [5.3, 1.0], ["Reason", "Locations"], fu_rows, size=min(ts, max(7.5, fu_rh * 45)),
+                   row_h=fu_rh, swatches=[SUB_CLASSES[c][2] for c in shown] + [None] * (2 if not shown else 1))
     fig.text(fx(0.35), fy(y - 0.07), "v4 / v8: checked against the Fabric version 4 / version 8 eligibility data. "
              "Location IDs: page 5 and the project workbook. Full key numbers: page 2.", fontsize=7.5, color=QUIET, va="top")
     # Bridge chart: eligible count from Fabric version 4 to version 8 by cause (deltas reconcile exactly)
@@ -3882,17 +4305,21 @@ def key_numbers_page(pdf, r: pd.Series, n_pages: int) -> None:
     panel_heading(fig, "How the change came together", 0.35, top)
     fit_text(fig, r["story_why"], 0.35, top - 0.28, PAGE_W - 0.7, 0.72, size=9.5, min_size=7.5)
     y0 = top - 1.12
-    rh = 0.205
-    size = 8.3
+    rh = 0.185
+    size = 8.0
 
-    def table(df: pd.DataFrame, x: float, y: float, label_w: float, col_w: float, heads: list[str], fmts: list) -> float:
+    def table(df: pd.DataFrame, x: float, y: float, label_w: float, col_w: float, heads: list[str], fmts: list,
+              hh: float = 0.42) -> float:
         rows = [[str(row.iloc[0])] + [f(v) for f, v in zip(fmts, row.iloc[1:])] for _, row in df.iterrows()]
         return draw_table(fig, x, y, [label_w] + [col_w] * (len(df.columns) - 1), [df.columns[0]] + heads, rows,
-                          size=size, row_h=rh, header_h=0.42)
+                          size=size, row_h=rh, header_h=hh)
+
+    SHORT = {S_EI: "Eligible,\ninside", S_NI: "Not\neligible,\ninside", S_EO: "Eligible,\noutside",
+             S_NO: "Not\neligible,\noutside", S_NOT: "Not in\nthe Fabric", S_CONF: "Conflicting\nsource\nrecords",
+             S_NB: "Not\nserviceable", "Total": "Total"}
 
     def short(c: str) -> str:
-        return (c.replace("Outside the project area", "Outside").replace("Not in the Fabric", "Not in\nFabric")
-                 .replace(", inside", ",\ninside").replace("Not counted (not a broadband serviceable location)", "Not\ncounted"))
+        return SHORT.get(c, c)
 
     qd = qr_term(key)[:7]                                  # "2026 Q3"
     # Left column: Fabric in the area, coverage, Fabric from-to
@@ -3903,19 +4330,20 @@ def key_numbers_page(pdf, r: pd.Series, n_pages: int) -> None:
     D = t["Coverage"]
     y = table(D, xl, y - 0.14, 2.95, 1.1, ["Version 4\n(initial)", f"Version 8\n({qd})", "Change"], [fmt_n, fmt_n, fmt_d])
     F = t["From-to Fabric"]
-    y = table(F.set_axis(["Fabric in the area: v4 → v8"] + list(F.columns[1:]), axis=1), xl, y - 0.14, 1.85,
-              (wl - 1.85) / (len(F.columns) - 1), [short(c) for c in F.columns[1:]], [fmt_n] * (len(F.columns) - 1))
+    y = table(F.set_axis(["Fabric in the area: v4 → v8"] + list(F.columns[1:]), axis=1), xl, y - 0.14, 1.75,
+              (wl - 1.75) / (len(F.columns) - 1), [short(c) for c in F.columns[1:]], [fmt_n] * (len(F.columns) - 1),
+              hh=0.56)
     # Right column: grantee lists against both versions, then where the initial list's locations went
     xr = 6.85
     wr = PAGE_W - 0.35 - xr
     B = t["Grantee lists"]
     hb = ["Initial\nsubmission, v4", f"{qd}\ndata, v8", "Change", "Initial\nsubmission, v8", f"{qd}\ndata, v4"]
     yb = table(B, xr, y0, 2.55, (wr - 2.55) / 5, hb, [fmt_n, fmt_n, fmt_d, fmt_n, fmt_n])
+    fig.text(fx(xr), fy(yb - 0.05), "Last two columns (check): each list looked up in the other Fabric version.",
+             fontsize=7.5, color=QUIET, va="top")
     I = t["From-to initial list"]
-    table(I.set_axis(["Initial submission: v4 → v8"] + list(I.columns[1:]), axis=1), xr, yb - 0.14, 1.85,
-          (wr - 1.85) / (len(I.columns) - 1), [short(c) for c in I.columns[1:]], [fmt_n] * (len(I.columns) - 1))
-    fig.text(fx(xr), fy(yb - 0.14 - 0.42 - rh * len(I) - 0.1),
-             "v8 (check) and v4 (check): each list looked up in the other Fabric version.", fontsize=7.5, color=QUIET, va="top")
+    table(I.set_axis(["Initial submission: v4 → v8"] + list(I.columns[1:]), axis=1), xr, yb - 0.3, 1.75,
+          (wr - 1.75) / (len(I.columns) - 1), [short(c) for c in I.columns[1:]], [fmt_n] * (len(I.columns) - 1), hh=0.56)
     pdf.savefig(fig)
     plt.close(fig)
 
