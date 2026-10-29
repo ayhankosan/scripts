@@ -2570,8 +2570,10 @@ FLOWS = [(S_EI, S_NI, -1, "eligible to not eligible"), (S_EI, S_NOT, -1, "IDs pr
          (S_EI, OUT, -1, "points moved out of the area"), (S_EI, S_CONF, -1, "conflicting source records"),
          (S_NI, S_EI, +1, "not eligible to eligible"), (S_NOT, S_EI, +1, "IDs present only in version 8"),
          (OUT, S_EI, +1, "points moved into the area"), (S_CONF, S_EI, +1, "conflict in version 4 only")]
-FU_SHORT = {"B01": "outside the area or not in Fabric version 8", "B02": "not eligible in Fabric version 8",
-            "B03": "eligible, not carried over", "B04": "new, already eligible in version 4"}
+FU_SHORT = {"B01": "not in Fabric version 8", "B13": "outside the award area", "B02": "not eligible in Fabric version 8",
+            "B14": "not a broadband serviceable location", "B03": "eligible, not carried over",
+            "B04": "new, already eligible in version 4", "B12": "conflicting source records"}
+assert set(FOLLOW_UP_CLASSES) <= set(FU_SHORT), "every follow-up category needs a short label"
 
 
 def main_reasons(key: str, top: int = 3) -> str:
@@ -2639,7 +2641,7 @@ for key in PROJECTS:
         GLANCE_COLS[5]: f"{bad8:,} of {k['sub8_v8_listed']:,}",
         GLANCE_COLS[6]: f"{k['sub4_v4_notfound']:,} / {k['sub8_v8_notfound']:,}",
         GLANCE_COLS[7]: f"{k['d_v8_listed']:,} of {k['a_v8_elig']:,}",
-        GLANCE_COLS[8]: f"{int(r['fu_total']):,}" + (f" ({fu[big_fu]:,} {FU_SHORT[big_fu]})" if r["fu_total"] else ""),
+        GLANCE_COLS[8]: f"{int(r['fu_total']):,}" + (f" ({fu[big_fu]:,} {FU_SHORT.get(big_fu, lower_first(SUB_CLASSES[big_fu][0]))})" if r["fu_total"] else ""),
         GLANCE_COLS[9]: r["patterns"],
         GLANCE_COLS[10]: k["actions"],
         GLANCE_COLS[11]: next_step(key)})
@@ -2975,11 +2977,14 @@ KEY_SECTIONS = [
     ("Summary", ["patterns", "pattern_notes", "bottom_line", "story_why", "story_a", "story_b", "story_c",
                  "sub_v8_file"]),
 ]
-ASK = {"B01": "Ask why a location outside the awarded area, or missing from the Fabric version 8 eligibility data, "
-              "is in the 2026 data.",
-       "B02": "Ask how a location that the Fabric version 8 eligibility data shows as served qualifies.",
+ASK = {"B01": "Ask for the Fabric version 8 location ID of this location in the 2026 Q2 and Q3 data.",
+       "B13": "Ask why a location outside the awarded area is in the 2026 Q2 and Q3 data.",
+       "B02": "Ask how a location that the Fabric version 8 eligibility data classifies as not eligible qualifies.",
+       "B14": "Ask whether this location is a broadband serviceable location.",
        "B03": "Ask why an eligible location in the initial grantee submission is not in the 2026 data.",
-       "B04": "Ask why this already-eligible location was not in the initial grantee submission."}
+       "B04": "Ask why this already-eligible location was not in the initial grantee submission.",
+       "B12": "Request corrected data: the Fabric copies of this location ID disagree on eligibility."}
+assert set(FOLLOW_UP_CLASSES) <= set(ASK), "every follow-up category needs a question"
 YES_NO_COLS = {"in_sub_v4", "in_sub_v8", "elig_v4", "elig_v8"}
 COLUMN_HEADS = {"project": "Project", "location_id": "Location ID", "map_label": "Category", "tier": "Tier",
                 "what_it_means": "What the category means", "why": "Why the list changed", "detail": "Detail",
