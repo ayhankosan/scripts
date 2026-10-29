@@ -8,13 +8,14 @@ For each project the script answers two questions, both checked against the awar
 
 Outputs in OUTPUT_DIR, one folder per project (e.g. SLO_PR-5578):
   <project>_locations.gdb   project_area, submitted_locations (Yes/No flags per location ID), fabric_changes
-  <project>_results.xlsx    Summary, Follow-up, List quality, Fabric changes, Definitions
-  <project>_results.md      the same summary and follow-up list as text
+  <project>_results.xlsx    Summary, For review, List quality, Fabric changes, Definitions
+  <project>_results.md      the same summary and review list as text
   <project>_maps_gray.pdf / _maps_imagery.pdf   three map pages each
 plus FFA_V4_V8_all_projects_overview.xlsx (one row per project).
 
 Run:  python FFA_V4_V8_compact_review.py      (edit only the Configuration section)
-Needs: duckdb, geopandas, pyogrio, shapely, pandas, numpy, openpyxl, matplotlib, requests; contextily for basemaps.
+Needs: duckdb, geopandas, pyogrio, shapely, pandas, numpy, openpyxl, matplotlib (with Pillow), requests.
+Basemaps are Esri tiles fetched over the internet; without access the maps draw on a plain background.
 """
 from __future__ import annotations
 
@@ -803,8 +804,8 @@ E_LOST, E_GAINED, E_BOTH, E_NONE = "Lost eligibility", "Became eligible", "Eligi
 A_IN_BOTH, A_OUT_BOTH, A_MOVED_IN, A_MOVED_OUT, A_NA = ("Inside in both", "Outside in both", "Moved inside the area",
                                                         "Moved outside the area", "Not comparable")
 
-# Follow-up reasons, highest priority first: (code, short reason, question for the grantee)
-FOLLOW_UP = [
+# Review reasons, highest priority first: (code, short reason, question for the grantee)
+REVIEW = [
     ("not_in_fabric8", "Not in Fabric 8", "What is the Fabric version 8 location ID for this location?"),
     ("conflict", "Conflicting Fabric records", "Fabric copies of this ID disagree on eligibility; which applies?"),
     ("outside", "Outside the project area", "Why is a location outside the awarded area in the 2026 list?"),
@@ -814,8 +815,8 @@ FOLLOW_UP = [
     ("added_eligible", "Added but already eligible in Fabric 4",
      "Why was this already-eligible location not in the initial submission?"),
 ]
-FU_LABEL = {c: lab for c, lab, _ in FOLLOW_UP}
-FU_QUESTION = {c: q_ for c, _, q_ in FOLLOW_UP}
+FU_LABEL = {c: lab for c, lab, _ in REVIEW}
+FU_QUESTION = {c: q_ for c, _, q_ in REVIEW}
 
 
 def place_words(eligible: bool, inside: bool) -> str:
@@ -882,7 +883,7 @@ def fabric_words(r: pd.Series, n: str) -> str:
 loc["fabric_4"] = loc.apply(lambda r: fabric_words(r, "4"), axis=1)
 loc["fabric_8"] = loc.apply(lambda r: fabric_words(r, "8"), axis=1)
 
-# Follow-up flags (2026 list: current exceptions; removed / added: unexplained list changes)
+# Review flags (2026 list: current exceptions; removed / added: unexplained list changes)
 cur = loc["in_2026_list"]
 removed, added = loc["list_change"].eq(LIST_REMOVED), loc["list_change"].eq(LIST_ADDED)
 usable8 = in8 & ~loc["conflict_8"]
@@ -897,10 +898,10 @@ flags = {
 }
 for c, m in flags.items():
     loc[f"fu_{c}"] = m.to_numpy()
-fu_cols = [f"fu_{c}" for c, _, _ in FOLLOW_UP]
-loc["needs_follow_up"] = loc[fu_cols].any(axis=1)
-loc["follow_up_reason"] = loc.apply(lambda r: "; ".join(FU_LABEL[c] for c, _, _ in FOLLOW_UP if r[f"fu_{c}"]), axis=1)
-loc["primary_reason"] = loc.apply(lambda r: next((c for c, _, _ in FOLLOW_UP if r[f"fu_{c}"]), ""), axis=1)
+fu_cols = [f"fu_{c}" for c, _, _ in REVIEW]
+loc["for_review"] = loc[fu_cols].any(axis=1)
+loc["review_reason"] = loc.apply(lambda r: "; ".join(FU_LABEL[c] for c, _, _ in REVIEW if r[f"fu_{c}"]), axis=1)
+loc["primary_reason"] = loc.apply(lambda r: next((c for c, _, _ in REVIEW if r[f"fu_{c}"]), ""), axis=1)
 loc["question"] = loc["primary_reason"].map(FU_QUESTION).fillna("")
 
 
@@ -917,7 +918,7 @@ def what_changed(r: pd.Series) -> str:
 
 loc["what_changed"] = loc.apply(what_changed, axis=1)
 loc["status_2026"] = np.where(~cur, "Not in the 2026 list",
-                              np.where(loc["needs_follow_up"] & cur, "Needs follow-up", "Eligible, inside the area"))
+                              np.where(loc["for_review"] & cur, "For review", "Eligible, inside the area"))
 
 # Map point: Fabric 8 point, else Fabric 4 point, else the grantee's own coordinates
 loc["lon"] = loc["lon_f8"].fillna(loc["lon_f4"]).fillna(loc["sub_lon"])
@@ -985,8 +986,8 @@ for key in PROJECTS:
     kept = l_[l_["list_change"].eq(LIST_KEPT)]
     k["kept_lost"] = int(kept["eligibility_change"].eq(E_LOST).sum())
     k["kept_moved_out"] = int(kept["area_change"].eq(A_MOVED_OUT).sum())
-    k["fu"] = {c_: int(l_[f"fu_{c_}"].sum()) for c_, _, _ in FOLLOW_UP}
-    k["fu_total"] = int(l_["needs_follow_up"].sum())
+    k["fu"] = {c_: int(l_[f"fu_{c_}"].sum()) for c_, _, _ in REVIEW}
+    k["fu_total"] = int(l_["for_review"].sum())
     k["cov_listed"], k["cov_eligible"] = k["s8_in_elig"], k["f8_elig"]
     FACTS[key] = k
 
@@ -1006,7 +1007,7 @@ def quarter(key: str) -> str:
 
 
 def story(key: str) -> dict[str, str]:
-    """Short plain sentences: Fabric, lists, current list, data quality, follow-up."""
+    """Short plain sentences: Fabric, lists, current list, data quality, review."""
     k, qr = FACTS[key], quarter(key)
     ch, ef = k["f_changes"], k["f_elig_effect"]
     drivers = [f"{ch.get(F_LOST, 0):,} lost eligibility" if ch.get(F_LOST) else "",
@@ -1039,7 +1040,7 @@ def story(key: str) -> dict[str, str]:
     quality = ("List quality: " + "; ".join(dq_items) + "." if dq_items else "List quality: no missing, invalid or "
                "duplicated IDs.")
     top = [FU_LABEL[c][0].lower() + FU_LABEL[c][1:] for c, n in sorted(k["fu"].items(), key=lambda x: -x[1]) if n][:2]
-    follow = (f"{n_(k['fu_total'], 'location')} need{'s' if k['fu_total'] == 1 else ''} follow-up"
+    follow = (f"{n_(k['fu_total'], 'location')} {'is' if k['fu_total'] == 1 else 'are'} flagged for review"
               + (f", mostly: {' and '.join(top)}." if top else "."))
     return {"fabric": fabric, "lists": lists, "current": current, "quality": quality, "follow": follow}
 
@@ -1066,12 +1067,12 @@ LOCATION_FIELDS = {   # geodatabase field: column in `loc` (Yes/No fields are wr
     "serviceable_location_fabric_8": "serviceable_8", "conflicting_fabric_records": "conflict_any",
     "eligibility_change": "eligibility_change", "area_change": "area_change", "fabric_4": "fabric_4",
     "fabric_8": "fabric_8", "what_changed": "what_changed", "status_2026_list": "status_2026",
-    "needs_follow_up": "needs_follow_up", "follow_up_reason": "follow_up_reason", "question_for_grantee": "question",
+    "for_review": "for_review", "review_reason": "review_reason", "question_for_grantee": "question",
     "point_from": "point_from", "lon": "lon", "lat": "lat"}
 loc["conflict_any"] = loc["conflict_4"] | loc["conflict_8"]
 YES_NO_FIELDS = {"in_initial_list", "in_2026_list", "listed_more_than_once", "in_fabric_4", "inside_area_fabric_4",
                  "eligible_fabric_4", "in_fabric_8", "inside_area_fabric_8", "eligible_fabric_8",
-                 "serviceable_location_fabric_8", "conflicting_fabric_records", "needs_follow_up"}
+                 "serviceable_location_fabric_8", "conflicting_fabric_records", "for_review"}
 
 
 def yes_no(df: pd.DataFrame, cols) -> pd.DataFrame:
@@ -1084,7 +1085,7 @@ def yes_no(df: pd.DataFrame, cols) -> pd.DataFrame:
 
 def location_layer(key: str) -> gpd.GeoDataFrame:
     d = loc[loc["project_key"] == key].copy()
-    d["_prio"] = d["primary_reason"].map({c: i for i, (c, _, _) in enumerate(FOLLOW_UP)}).fillna(99)
+    d["_prio"] = d["primary_reason"].map({c: i for i, (c, _, _) in enumerate(REVIEW)}).fillna(99)
     d = d.sort_values(["_prio", "location_id"])
     out = d[list(LOCATION_FIELDS.values())].set_axis(list(LOCATION_FIELDS), axis=1)
     return points_from_lonlat(yes_no(out, YES_NO_FIELDS))
@@ -1125,11 +1126,11 @@ def list_quality(key: str) -> pd.DataFrame:
                                        "Times listed"])
 
 
-def follow_up_table(key: str) -> pd.DataFrame:
-    d = loc[(loc["project_key"] == key) & loc["needs_follow_up"]].copy()
-    d["_prio"] = d["primary_reason"].map({c: i for i, (c, _, _) in enumerate(FOLLOW_UP)})
+def review_table(key: str) -> pd.DataFrame:
+    d = loc[(loc["project_key"] == key) & loc["for_review"]].copy()
+    d["_prio"] = d["primary_reason"].map({c: i for i, (c, _, _) in enumerate(REVIEW)})
     d = d.sort_values(["_prio", "location_id"])
-    return pd.DataFrame({"Location ID": d["location_id"].astype("int64"), "Reason": d["follow_up_reason"],
+    return pd.DataFrame({"Location ID": d["location_id"].astype("int64"), "Reason": d["review_reason"],
                          "What changed": d["what_changed"], "Question for the grantee": d["question"]})
 
 
@@ -1157,11 +1158,11 @@ def summary_tables(key: str) -> dict[str, pd.DataFrame]:
         columns=["Grantee list", "Initial list (checked in Fabric 4)", f"{qr} list (checked in Fabric 8)"])
     change = pd.DataFrame([(LIST_KEPT, k["kept"]), (LIST_REMOVED, k["removed"]), (LIST_ADDED, k["added"])],
                           columns=["Initial list → " + qr + " list", "Locations"])
-    fu = pd.DataFrame([(FU_LABEL[c], k["fu"][c]) for c, _, _ in FOLLOW_UP if k["fu"][c]],
-                      columns=["Needs follow-up (a location can have several reasons)", "Locations"])
-    fu.loc[len(fu)] = ["Locations that need follow-up", k["fu_total"]]
+    fu = pd.DataFrame([(FU_LABEL[c], k["fu"][c]) for c, _, _ in REVIEW if k["fu"][c]],
+                      columns=["Flagged for review (a location can have several reasons)", "Locations"])
+    fu.loc[len(fu)] = ["Locations for review", k["fu_total"]]
     return {"Fabric locations inside the project area": fabric, "Why the eligible count changed": bridge,
-            "Grantee lists": lists, "How the list changed": change, "Needs follow-up": fu}
+            "Grantee lists": lists, "How the list changed": change, "Reasons for review": fu}
 
 
 DEFINITIONS = [
@@ -1183,7 +1184,7 @@ DEFINITIONS = [
     ("Listed more than once", "The ID appears on more than one row of a list; it is counted once."),
     ("Rows without an ID / invalid ID", "Rows with an empty ID field, or text that is not a whole number; they cannot be "
                                         "placed on a map and are listed in the List quality tab."),
-    ("Needs follow-up", "2026 list: not in Fabric 8, conflicting records, outside the area, not eligible, or not a "
+    ("For review", "2026 list: not in Fabric 8, conflicting records, outside the area, not eligible, or not a "
                         "broadband serviceable location. Removed although still eligible inside the area. Added although "
                         "already eligible inside the area in Fabric 4."),
     ("Coverage", "Eligible locations inside the area in Fabric 8 that the 2026 list includes."),
@@ -1241,7 +1242,7 @@ def put_table(ws, df: pd.DataFrame, row: int, title: str | None = None, widths: 
                 col = df.columns[j - 1]
                 cell.number_format = ("0" if col in PLAIN_NUMBER_COLS else
                                       "+#,##0;-#,##0;0" if col in SIGNED_COLS else "#,##0")
-        if str(r[0]).startswith(("Total", "Locations that need")):
+        if str(r[0]).startswith(("Total", "Locations for review")):
             for j in range(1, len(df.columns) + 1):
                 ws.cell(i, j).font = Font(bold=True)
     return row + len(df) + 2
@@ -1288,7 +1289,7 @@ def project_workbook(key: str, path: Path) -> None:
         row = put_table(ws, df, row, title)
     for col, w in zip("ABCD", (46, 30, 30, 22)):
         ws.column_dimensions[col].width = w
-    sheet_from(wb, "Follow-up", follow_up_table(key), [14, 40, 70, 60])
+    sheet_from(wb, "For review", review_table(key), [14, 40, 70, 60])
     sheet_from(wb, "List quality", list_quality(key), [16, 36, 12, 24, 14, 12])
     fct = fabric_change_table(key).drop(columns=["lon", "lat"]).rename(columns={
         "location_id": "Location ID", "change": "What happened", "eligible_fabric_4": "Eligible in Fabric 4",
@@ -1317,13 +1318,13 @@ def md_table(df: pd.DataFrame) -> str:
 
 
 def project_markdown(key: str, path: Path) -> None:
-    st, fu, lq = STORIES[key], follow_up_table(key), list_quality(key)
+    st, fu, lq = STORIES[key], review_table(key), list_quality(key)
     out = [f"# {LABEL[key]} ({PR_NUMBERS[key]})\n",
            f"Fabric version 4 → version 8 and initial grantee submission → {quarter(key)} list. Run on {RUN_DATE}.\n",
            "## What changed\n", *[f"- {t}" for t in st.values()], ""]
     for title, df in summary_tables(key).items():
         out += [f"## {title}\n", md_table(df)]
-    out += [f"## Locations that need follow-up ({len(fu):,})\n",
+    out += [f"## Locations for review ({len(fu):,})\n",
             md_table(fu.drop(columns="What changed")) if len(fu) else "None.\n",
             f"## List quality ({len(lq):,} rows)\n", md_table(lq.dropna(axis=1, how="all")) if len(lq) else "None.\n",
             "Every changed Fabric location ID is in the Fabric changes tab of the workbook and in the `fabric_changes` "
@@ -1348,7 +1349,7 @@ def overview_workbook(path: Path) -> None:
                      "2026 list: not in Fabric 8": k["s8_not_found"],
                      "Rows without or with an invalid ID": k["s4_no_id"] + k["s4_bad_id"] + k["s8_no_id"] + k["s8_bad_id"],
                      "IDs listed more than once": k["s4_dup_ids"] + k["s8_dup_ids"],
-                     "Locations that need follow-up": k["fu_total"],
+                     "Locations for review": k["fu_total"],
                      "Coverage (2026 list of eligible in the area)": f"{k['cov_listed']:,} of {k['cov_eligible']:,}"})
     df = pd.DataFrame(rows)
     wb = Workbook()
@@ -1366,7 +1367,7 @@ def overview_workbook(path: Path) -> None:
 
 
 # =====================================================================================================================
-# 10. Map pages (PDF): Fabric eligibility change, grantee list change, follow-up – on gray canvas and on imagery
+# 10. Map pages (PDF): Fabric eligibility change, grantee list change, locations for review – on gray canvas and on imagery
 # =====================================================================================================================
 import textwrap
 
@@ -1378,11 +1379,10 @@ from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
 from matplotlib.patches import Rectangle
 
-try:
-    import contextily as ctx
-except ImportError:                                   # basemaps are optional
-    ctx = None
-    log.warning("contextily not installed: maps draw without a basemap (pip install contextily)")
+import io
+import math
+
+from PIL import Image
 
 MERC = "EPSG:3857"
 PAGE_W, PAGE_H = 14.0, 8.5                            # inches, legal landscape
@@ -1392,9 +1392,17 @@ PANEL_X_IN = MAP_LEFT_IN + MAP_FRAME_W_IN + 0.35
 PANEL_W_IN = PAGE_W - PANEL_X_IN - 0.35
 PAD_FRACTION = 0.06
 NAVY, INK, QUIET = "#1F3864", "#1d1d1f", "#5f6368"
-BASEMAPS = {"gray": ("Esri.WorldGrayCanvas", "Basemap: Esri, HERE, Garmin, © OpenStreetMap contributors"),
-            "imagery": ("Esri.WorldImagery", "Basemap: Esri, Maxar, Earthstar Geographics")}
-basemap_ok = {"gray": ctx is not None, "imagery": ctx is not None}
+# Esri tile services: (URL with {z}/{y}/{x}, highest zoom level, credit)
+BASEMAPS = {"gray": ("https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Light_Gray_Base/MapServer/tile/"
+                     "{z}/{y}/{x}", 16, "Basemap: Esri, HERE, Garmin, © OpenStreetMap contributors"),
+            "imagery": ("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+                        19, "Basemap: Esri, Maxar, Earthstar Geographics")}
+basemap_ok = {"gray": True, "imagery": True}
+basemap_error: dict[str, str] = {}
+TILE_PIXELS_ACROSS = 1800          # basemap detail: tile pixels across the map frame
+MAX_TILES = 120                    # tiles per map at most (zoom drops until the map fits)
+_tile_cache: dict[tuple, Image.Image] = {}
+WORLD = 2 * math.pi * 6378137      # Web Mercator world width (m)
 DESC_SIZE, LEGEND_SIZE, LEGEND_MARKER = 10.0, 9.0, 7.5
 POINT_SIZE = {"main": 26, "context": 9}               # marker area (pt²)
 LOCATOR_H_IN, LOCATOR_MIN_H_IN = 1.3, 0.65
@@ -1415,9 +1423,9 @@ PAGE_CLASSES = {
                F_SAME_E: ("skyblue", "No change", "context"), F_SAME_N: ("lightgrey", "No change", "shaded")},
     "lists": {LIST_REMOVED: ("purple", "Grantee lists", "main"), LIST_ADDED: ("pink", "Grantee lists", "main"),
               LIST_KEPT: ("grey", "Grantee lists", "main")},
-    "follow": {**{FU_LABEL[c]: (col, "Needs follow-up (main reason)", "main") for (c, _, _), col in zip(FOLLOW_UP, (
+    "follow": {**{FU_LABEL[c]: (col, "For review (main reason)", "main") for (c, _, _), col in zip(REVIEW, (
         "darkred", "olive", "charcoal", "darkorange", "slate", "purple", "pink"))},
-               "Other listed location": ("lightgrey", "No follow-up", "context")},
+               "Other listed location": ("lightgrey", "Not flagged", "context")},
 }
 FOOTER = (f"Sources: Fabric version 4 (field {V4_FIELD_NAME}) and version 8 (field {V8_FIELD_NAME}) eligibility data, "
           "0 = unserved (eligible), 1 = served; CPUC FFA awarded project areas; initial grantee submission and 2026 "
@@ -1481,21 +1489,52 @@ def panel_heading(fig, text: str, x_in: float, y_in: float) -> None:
     fig.text(fx(x_in), fy(y_in), text, fontsize=11.5, fontweight="bold", color=NAVY, va="top")
 
 
-def add_basemap(ax, kind: str, zoom_adjust: int = 0) -> bool:
+def get_tile(kind: str, z: int, x: int, y: int) -> Image.Image:
+    """One 256-pixel Esri tile (cached for the run)."""
+    k = (kind, z, x, y)
+    if k not in _tile_cache:
+        r = requests.get(BASEMAPS[kind][0].format(z=z, y=y, x=x), timeout=30,
+                         headers={"User-Agent": "FFA-V4-V8-review/1.0"})
+        r.raise_for_status()
+        _tile_cache[k] = Image.open(io.BytesIO(r.content)).convert("RGB")
+    return _tile_cache[k]
+
+
+def tile_mosaic(kind: str, extent, pixels_across: int) -> tuple[Image.Image, tuple]:
+    """Stitched tiles covering a Web Mercator extent, and the extent of the stitched image."""
+    x0, y0, x1, y1 = extent
+    z = int(np.clip(round(math.log2(WORLD * pixels_across / (256 * (x1 - x0)))), 0, BASEMAPS[kind][1]))
+    while True:
+        size = WORLD / 2 ** z                                            # tile width (m)
+        tx0, tx1 = int((x0 + WORLD / 2) // size), int((x1 + WORLD / 2) // size)
+        ty0, ty1 = int((WORLD / 2 - y1) // size), int((WORLD / 2 - y0) // size)
+        if (tx1 - tx0 + 1) * (ty1 - ty0 + 1) <= MAX_TILES or z == 0:
+            break
+        z -= 1
+    img = Image.new("RGB", ((tx1 - tx0 + 1) * 256, (ty1 - ty0 + 1) * 256))
+    for tx in range(tx0, tx1 + 1):
+        for ty in range(ty0, ty1 + 1):
+            img.paste(get_tile(kind, z, tx % 2 ** z, ty), ((tx - tx0) * 256, (ty - ty0) * 256))
+    ext = (tx0 * size - WORLD / 2, (tx1 + 1) * size - WORLD / 2, WORLD / 2 - (ty1 + 1) * size, WORLD / 2 - ty0 * size)
+    return img, ext
+
+
+def add_basemap(ax, kind: str, pixels_across: int = TILE_PIXELS_ACROSS) -> bool:
     """Esri tiles under the map; False (plain background) when tiles cannot be fetched."""
     ax.set_facecolor("#f4f4f2")
     if not basemap_ok.get(kind):
         return False
+    xlim, ylim = ax.get_xlim(), ax.get_ylim()
     try:
-        src = ctx.providers
-        for part in BASEMAPS[kind][0].split("."):
-            src = src[part]
-        ctx.add_basemap(ax, crs=MERC, source=src, attribution=False, zoom_adjust=zoom_adjust, reset_extent=True)
-        return True
-    except Exception as e:                              # offline or tile server refused
+        img, ext = tile_mosaic(kind, (xlim[0], ylim[0], xlim[1], ylim[1]), pixels_across)
+    except Exception as e:                              # offline, proxy or tile server refused
         log.warning("Basemap '%s' unavailable (%s); maps draw on a plain background", kind, e)
         basemap_ok[kind] = False
+        basemap_error[kind] = str(e)
         return False
+    ax.imshow(img, extent=ext, interpolation="bilinear", zorder=0)
+    ax.set_xlim(xlim), ax.set_ylim(ylim)
+    return True
 
 
 def scale_bar(ax, extent, lat: float) -> None:
@@ -1635,9 +1674,7 @@ LOCATOR_H_IN, LOCATOR_MIN_H_IN = 1.3, 0.65
 
 
 def locator(fig, key: str, extent, kind: str, h_in: float = LOCATOR_H_IN) -> None:
-    """Small overview map with labelled towns and the main map's frame, when a basemap is available."""
-    if not basemap_ok.get(kind):
-        return
+    """Small overview map with labelled towns and the main map's frame (plain background when tiles are missing)."""
     import matplotlib.patheffects as pe
     w_in = PANEL_W_IN
     ax = fig.add_axes([fx(PANEL_X_IN), fy(MAP_BOTTOM_IN), fx(w_in), fy(h_in)])
@@ -1647,9 +1684,7 @@ def locator(fig, key: str, extent, kind: str, h_in: float = LOCATOR_H_IN) -> Non
     lx0, lx1 = cx - span_h * w_in / h_in / 2, cx + span_h * w_in / h_in / 2
     ly0, ly1 = cy - span_h / 2, cy + span_h / 2
     ax.set_xlim(lx0, lx1), ax.set_ylim(ly0, ly1)
-    if not add_basemap(ax, kind, zoom_adjust=-1):
-        ax.remove()
-        return
+    add_basemap(ax, kind, pixels_across=500)
     ax.set_xlim(lx0, lx1), ax.set_ylim(ly0, ly1)
     ax.add_patch(Rectangle((x0, y0), x1 - x0, y1 - y0, fill=False, edgecolor=NAVY, lw=1.6, zorder=6))
     ax.set_xticks([]), ax.set_yticks([])
@@ -1696,7 +1731,7 @@ def page_points(key: str) -> dict[str, gpd.GeoDataFrame]:
     f = fc[fc["project_key"] == key].assign(cls=lambda d: d["change"])
     l_ = loc[loc["project_key"] == key]
     lists = l_.assign(cls=l_["list_change"])
-    follow = l_.assign(cls=np.where(l_["needs_follow_up"], l_["primary_reason"].map(FU_LABEL), "Other listed location"))
+    follow = l_.assign(cls=np.where(l_["for_review"], l_["primary_reason"].map(FU_LABEL), "Other listed location"))
     out = {}
     for name, df in (("fabric", f), ("lists", lists), ("follow", follow)):
         g = points_from_lonlat(df[["cls", "lon", "lat"]].reset_index(drop=True)).dropna(subset=["geometry"])
@@ -1720,6 +1755,25 @@ def page_extent(key: str, pts: dict) -> tuple[tuple, int]:
     return (cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2), far
 
 
+TOTALS_H_IN = 0.95                                  # height of the totals block under the legend
+
+
+def draw_totals(fig, key: str, x_in: float, y_top_in: float, w_in: float) -> float:
+    """Totals of the four datasets, the same on every page; returns the y under the block."""
+    k, qr = FACTS[key], quarter(key)
+    rows = [(f"Fabric 4, inside the area ({k['f4_elig']:,} eligible)", k["f4_total"]),
+            (f"Fabric 8, inside the area ({k['f8_elig']:,} eligible)", k["f8_total"]),
+            ("Initial list (location IDs)", k["s4_listed"]),
+            (f"{qr} list (location IDs)", k["s8_listed"])]
+    fig.text(fx(x_in), fy(y_top_in), "Totals", fontsize=8.5, fontweight="bold", color=QUIET, va="top")
+    y = y_top_in - 0.19
+    for lab, n in rows:
+        fig.text(fx(x_in + 0.24), fy(y), lab, fontsize=8.5, color=INK, va="top")
+        fig.text(fx(x_in + w_in), fy(y), f"{n:,}", fontsize=8.5, color=INK, va="top", ha="right")
+        y -= 0.17
+    return y
+
+
 def map_page(pdf, key: str, page: str, pts: gpd.GeoDataFrame, extent, far: int, no_xy: int, kind: str,
              page_no: int) -> None:
     """One map page: map on the left; description, legend and overview map on the right."""
@@ -1730,8 +1784,8 @@ def map_page(pdf, key: str, page: str, pts: gpd.GeoDataFrame, extent, far: int, 
                    st["fabric"]),
         "lists": ("Grantee list change", f"Initial grantee submission compared with the {qr} list",
                   st["lists"] + " " + st["current"]),
-        "follow": ("Locations that need follow-up", "Listed locations to raise with the grantee",
-                   st["follow"] + " " + st["quality"] + " Location IDs and questions: Follow-up tab of the workbook."),
+        "follow": ("Locations for review", "Listed locations flagged for review, by main reason",
+                   st["follow"] + " " + st["quality"] + " Location IDs and questions: For review tab of the workbook."),
     }[page]
     classes = PAGE_CLASSES[page]
     imagery = kind == "imagery"
@@ -1740,7 +1794,7 @@ def map_page(pdf, key: str, page: str, pts: gpd.GeoDataFrame, extent, far: int, 
     ax.set_xlim(extent[0], extent[2]), ax.set_ylim(extent[1], extent[3])
     tiles = add_basemap(ax, kind)
     page_frame(fig, f"{LABEL[key]} ({PR_NUMBERS[key]}) · {heading}", sub, page_no, 3,
-               credit=BASEMAPS[kind][1] if tiles else "")
+               credit=BASEMAPS[kind][2] if tiles else "")
     ax.set_xlim(extent[0], extent[2]), ax.set_ylim(extent[1], extent[3])
     areas.loc[areas["project_key"] == key].to_crs(MERC).boundary.plot(
         ax=ax, color="white" if imagery else NAVY, linewidth=1.6, zorder=15)
@@ -1775,19 +1829,22 @@ def map_page(pdf, key: str, page: str, pts: gpd.GeoDataFrame, extent, far: int, 
                 bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="none", alpha=0.9))
     top = MAP_BOTTOM_IN + MAP_FRAME_H_IN
     panel_heading(fig, "Description", PANEL_X_IN, top)
-    t = fit_text(fig, desc, PANEL_X_IN, top - 0.3, PANEL_W_IN, 2.9, size=DESC_SIZE, min_size=8)
+    t = fit_text(fig, desc, PANEL_X_IN, top - 0.3, PANEL_W_IN, 2.5, size=DESC_SIZE, min_size=8)
     desc_h = t.get_window_extent(renderer=fig.canvas.get_renderer()).height / fig.dpi
     leg_top = top - 0.3 - desc_h - 0.3
     panel_heading(fig, "Legend", PANEL_X_IN, leg_top)
     fig.text(fx(PANEL_X_IN + PANEL_W_IN), fy(leg_top), "Locations", fontsize=8.5, color=QUIET, ha="right", va="top")
     y_end = draw_legend(fig, counts, classes, PANEL_X_IN, leg_top - 0.32, PANEL_W_IN,
-                        leg_top - 0.32 - (MAP_BOTTOM_IN + LOCATOR_MIN_H_IN + 0.35))
+                        leg_top - 0.32 - (MAP_BOTTOM_IN + LOCATOR_MIN_H_IN + 0.35 + TOTALS_H_IN))
     y_area = y_end - 0.12
+    if imagery:                                         # white line on a dark edge, as drawn on the imagery
+        fig.add_artist(Line2D([fx(PANEL_X_IN + 0.02), fx(PANEL_X_IN + 0.18)], [fy(y_area)] * 2, color=INK, lw=3.2))
     fig.add_artist(Line2D([fx(PANEL_X_IN + 0.02), fx(PANEL_X_IN + 0.18)], [fy(y_area)] * 2,
-                          color=NAVY, lw=1.6))
+                          color="white" if imagery else NAVY, lw=1.6))
     fig.text(fx(PANEL_X_IN + 0.24), fy(y_area), "Project area" + (" (white on imagery)" if imagery else ""),
              fontsize=8.5, color=INK, va="center")
-    locator(fig, key, extent, kind, h_in=float(np.clip(y_area - 0.25 - MAP_BOTTOM_IN, LOCATOR_MIN_H_IN, LOCATOR_H_IN)))
+    y_tot = draw_totals(fig, key, PANEL_X_IN, y_area - 0.22, PANEL_W_IN)
+    locator(fig, key, extent, kind, h_in=float(np.clip(y_tot - 0.2 - MAP_BOTTOM_IN, LOCATOR_MIN_H_IN, LOCATOR_H_IN)))
     pdf.savefig(fig)
     plt.close(fig)
 
@@ -1821,9 +1878,11 @@ for key in PROJECTS:
     log.info("%s → %s", key, folder)
 overview_workbook(OUTPUT_DIR / "FFA_V4_V8_all_projects_overview.xlsx")
 
-# Checks: every submitted ID appears once per project; follow-up map classes match the flags
+# Checks: every submitted ID appears once per project; map classes match the flags
 assert not loc.duplicated(["project_key", "location_id"]).any()
 for key in PROJECTS:
     k = FACTS[key]
     assert k["kept"] + k["removed"] == k["s4_listed"] and k["kept"] + k["added"] == k["s8_listed"], key
+for kind, err in basemap_error.items():
+    log.warning("No %s basemap on the maps: %s. Check internet or proxy access to server.arcgisonline.com.", kind, err)
 print("Done. Results in", OUTPUT_DIR)
